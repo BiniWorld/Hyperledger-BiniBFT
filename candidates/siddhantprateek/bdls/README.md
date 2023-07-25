@@ -1,4 +1,6 @@
-# Research: BDLS
+# Research: `BDLS`
+
+`Author: Siddhant Prateek Mahanayak`
 
 
 ## Setting up BDLS on Linux Server.

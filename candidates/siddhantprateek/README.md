@@ -8,6 +8,10 @@ Email: siddhantprateek@gmail.com
 
 ## Week 1
 
+```js
+Date: July 3, 2023 - July 8, 2023
+```
+
 - Team Introduction: Introduce team members to each other, including their roles and responsibilities.
 - Project Overview: Provide an overview of the project, its goals, and objectives.
 Expectations and Goals: Set clear expectations for team members, clarify project goals, and ensure everyone is aligned.
@@ -16,6 +20,9 @@ Expectations and Goals: Set clear expectations for team members, clarify project
 - Project Planning: Initiate the project planning phase, including defining tasks, milestones, and dependencies.
 
 ## Week 2 
+```js
+Date: July 10, 2023 - July 14, 2023
+```
 
 - Research and Background: Conduct any necessary research to gain a deeper understanding of the project domain. The team discussed the use case and identified the need for a consensus algorithm, specifically the Raft consensus algorithm. Raft Consensus Shortcomings: During discussions, the limitations of the Raft consensus algorithm were analyzed, highlighting potential areas for improvement.
 
@@ -27,6 +34,10 @@ Expectations and Goals: Set clear expectations for team members, clarify project
 
 ## Week 3
 
+```js
+Date: July 17, 2023 - July 21, 2023
+```
+
 - BFT Consensus Methods and Blockchain Interaction: Researched and examined existing Byzantine Fault Tolerant (BFT) consensus methods and their interaction with blockchain systems. Evaluated how BFT algorithms enhance the security and reliability of blockchain networks.
 
 - Overview of Raft Consensus Algorithm: Provided a concise overview of the Raft consensus algorithm. Described its key components, including leader election, log replication, and safety properties. Understood the algorithm's role in achieving consensus in distributed systems.
@@ -34,6 +45,10 @@ Expectations and Goals: Set clear expectations for team members, clarify project
 - Benefits and Use Cases of Raft: Led a discussion on the benefits and use cases of the Raft algorithm within the context of Hyperledger projects. Emphasized its advantages, such as simplicity, fault tolerance, and ease of understanding. Explored potential applications in distributed ledgers, permissioned blockchains, and decentralized applications.
 
 ## Week 4
+
+```js
+Date: July 24, 2023 - July 28, 2023
+```
 
 - Hyperledger Labs BDLS: Researched and obtained the necessary resources to install Hyperledger Labs BDLS, a distributed ledger system designed to work with various consensus algorithms.
 

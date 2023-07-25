@@ -8,7 +8,7 @@ We are grateful to the following mentees for their contributions to this project
 
 - [Siddhant Prateek Mahanayak](https://github.com/siddhantprateek/)
 - [Sandhu Sahil](https://github.com/Sandhu-Sahil)
-- [Ashna P S]()
+- [Ashna P S](https://github.com/ashnaps/)
 - [Riddhi Katarki]()
 - [Arun Sridhar]()
 - [Ajitesh soni]()

@@ -19,6 +19,7 @@ The mentee's main focus will be on creating detailed reports for each task or le
 > _Mentees Please include the path to your folder next to your name._
 
 [Siddhant Prateek Mahanayak](./siddhantprateek/README.md)
+[Sahilsher Singh Sandhu](./sahilsher-singh/README.md)
 
 ## Conclusion
 

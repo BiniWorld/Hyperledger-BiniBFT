@@ -1,34 +1,31 @@
-# Hyperledger BiniBFT
+# Blockchain for Dummies 😎
 
-The goal of this project is to develop BiniBFT, a powerful and robust Byzantine Fault Tolerance (BFT) consensus library for Hyperledger Fabric. The primary objective is to enhance the capabilities of Hyperledger Fabric, making it more suitable for a wide range of distributed and decentralized day-to-day applications. BiniBFT aims to achieve this by providing end-to-end security, high throughput with low latency, and exceptional scalability.
+[![Learn More](https://img.shields.io/badge/Learn-More-blue?style=for-the-badge)](https://github.com/Sandhu-Sahil/LFX-Hyperledger_progress-report)
 
-## Mentees
+Welcome to my daily progress report in the world of blockchain! 🌐 This repository contains a collection of blogs that I have created while learning about blockchain from scratch. It covers topics related to both public and private blockchains, and it is an ongoing work as I continue my learning journey. 🚀
 
-We are grateful to the following mentees for their contributions to this project:
+## Learning Journey
 
-- [Siddhant Prateek Mahanayak](https://github.com/siddhantprateek/)
-- [Sandhu Sahil](https://github.com/Sandhu-Sahil)
-- [Ashna P S](https://github.com/ashnaps/)
-- [Riddhi Katarki]()
-- [Arun Sridhar]()
-- [Ajitesh soni]()
-- [Abhishek Ranjan]()
+To track my progress and dive deeper into blockchain technology, you can check out the blogs in this repository. Each blog represents a milestone in my learning journey, and I'm thrilled to share my insights and discoveries with you. 📚
 
-### Code of Conduct
+## Blogs Progress
 
-We expect all contributors and participants in this project to adhere to the [Code of Conduct](./CODE_OF_CONDUCT.md). It outlines the guidelines for maintaining a respectful and inclusive community.
+I'm continuously adding new blogs as I explore different aspects of blockchain technology. 🎉
 
-### Contributors
+Includes the following topics:
+- [&#945;] [Public Blockchain](https://github.com/Sandhu-Sahil/LFX-Hyperledger_progress-report)
+- [&#946;] [Private Blockchain](https://github.com/Sandhu-Sahil/LFX-Hyperledger_progress-report)
+## Under Development
 
-The [CONTRIBUTORS.md](./CONTRIBUTORS.md) file acknowledges the individuals who have contributed to the project. We appreciate the efforts of all contributors in making BiniBFT a success.
+Please note that this repository is under development, and I'm continuously adding new blogs as I explore different aspects of blockchain technology. It's a way for me to document my learning journey and share my newfound knowledge with the community. So, stay tuned for more updates and exciting discoveries!
 
-## License 
-This project is licensed under the [GNU GENERAL PUBLIC LICENSE](./LICENSE). Make sure to review and comply with the terms and conditions of the license before using or contributing to the project.
+## Disclaimer
 
+The information provided in these blogs is for educational purposes only and does not constitute financial or investment advice. Blockchain and cryptocurrency investments carry risks, and you should always conduct your research before making any financial decisions.
 
-## Acknowledgments
+---
 
-We would like to express our gratitude to all contributors and everyone involved in the development of Hyperledger BiniBFT. Your dedication and support have been instrumental in making this project a reality.
+[![Learn More](https://img.shields.io/badge/Learn-More-blue?style=for-the-badge)](https://github.com/Sandhu-Sahil/LFX-Hyperledger_progress-report)
+[![Sandhu-Sahil](https://img.shields.io/badge/Author-Sandhu%20Sahil-red?style=for-the-badge)](https://github.com/Sandhu-Sahil)
 
-Thank you for being a part of Hyperledger BiniBFT!
-
+Feel free to explore the blogs in this repository and join me in this exciting journey of learning blockchain! Happy exploring! 🎓

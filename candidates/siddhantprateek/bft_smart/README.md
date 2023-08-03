@@ -3,7 +3,7 @@
 `Author: Siddhant Prateek Mahanayak`
 
 
-## About Hyperledger `Sawtooth``
+## About Hyperledger `Sawtooth`
 
 Hyperledger Sawtooth is an open-source blockchain platform developed by the Linux Foundation's Hyperledger project. It was designed to facilitate the creation, deployment, and management of distributed ledger applications. Sawtooth aims to provide a flexible and modular framework that allows developers to implement various blockchain applications with different business logic while also supporting multiple consensus mechanisms.
 

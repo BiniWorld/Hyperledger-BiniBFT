@@ -1,0 +1,1 @@
+export CORE_CHAINCODE_ID_NAME=ibp-microfab

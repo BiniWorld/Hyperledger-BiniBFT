@@ -68,3 +68,15 @@ Date: July 24, 2023 - July 28, 2023
 - Paxos: I have started to learn about Paxos and its consensus algorithms. Paxos is a consensus algorithm that is used to achieve consensus in a network of unreliable processors. It was first introduced by Leslie Lamport in 1989. It is a two-phase protocol that allows a collection of machines to agree on a value even if some of the machines fail. It is a leaderless algorithm that works in rounds. In each round, every node proposes a value and votes for a value proposed by some node. The algorithm guarantees that a single value will be agreed upon by all the non-faulty nodes. It contains three roles: proposer, acceptor, and learner. The proposer proposes a value, the acceptor accepts a value, after the decision all are converted into the learner learns the value.
 
 - Corda: I have started to learn about Cordo and its consensus algorithms. In this the transaction is not broadcasted to all the nodes, instead it is shared with the nodes which are involved in the transaction and the nortary node. Nortary node is the node which validates the transaction and then broadcast it to the other nodes.
+
+## Week 5
+
+```js
+Date: July 31, 2023 - August 4, 2023
+```
+
+- Hyperledger Fabric: I have started to learn about Hyperledger Fabric and its consensus algorithms. Hyperledger Fabric is a permissioned blockchain infrastructure, originally contributed by IBM and Digital Asset, providing a modular architecture with a delineation of roles between the nodes in the infrastructure, execution of Smart Contracts (called "chaincode" in Fabric) and configurable consensus and membership services. It contains a leader, follower, and candidate. The leader is responsible for managing the log and replicating it to other nodes. The follower is responsible for responding to requests from the leader and forwarding requests to the leader. The candidate is responsible for requesting votes from other nodes.
+
+- KBA course completed: I have completed my KBA course. I have learned about the basics of blockchain and its consensus algorithms. I have also created a little project to get a better understanding of the blockchain and its consensus algorithms. 
+
+- Mango tracking system: I have started to learn about the mango tracking system. I have also created a little project to get a better understanding of the blockchain and its consensus algorithms. Also created a little project to get a better understanding of the blockchain and its consensus algorithms.

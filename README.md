@@ -13,8 +13,8 @@ To track my progress and dive deeper into blockchain technology, you can check o
 I'm continuously adding new blogs as I explore different aspects of blockchain technology. 🎉
 
 Includes the following topics:
-- [&#945;] [Public Blockchain](https://github.com/Sandhu-Sahil/LFX-Hyperledger_progress-report)
-- [&#946;] [Private Blockchain](https://github.com/Sandhu-Sahil/LFX-Hyperledger_progress-report)
+- [&#945;] [Public Blockchain](https://github.com/Sandhu-Sahil/LFX-Hyperledger_progress-report/blob/master/day01-entry1.md)
+- [&#946;] [Private Blockchain](https://github.com/Sandhu-Sahil/LFX-Hyperledger_progress-report/blob/master/day21-entry1.md)
 ## Under Development
 
 Please note that this repository is under development, and I'm continuously adding new blogs as I explore different aspects of blockchain technology. It's a way for me to document my learning journey and share my newfound knowledge with the community. So, stay tuned for more updates and exciting discoveries!

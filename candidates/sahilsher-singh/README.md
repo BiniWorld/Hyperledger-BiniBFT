@@ -80,3 +80,15 @@ Date: July 31, 2023 - August 4, 2023
 - KBA course completed: I have completed my KBA course. I have learned about the basics of blockchain and its consensus algorithms. I have also created a little project to get a better understanding of the blockchain and its consensus algorithms. 
 
 - Mango tracking system: I have started to learn about the mango tracking system. I have also created a little project to get a better understanding of the blockchain and its consensus algorithms. Also created a little project to get a better understanding of the blockchain and its consensus algorithms.
+
+## Week 6
+
+```js
+Date: August 7, 2023 - August 11, 2023
+```
+
+- https://github.com/Sandhu-Sahil/bootstrapping-hyperledger: Bootstrapping Hyperledger Fabric Network.
+
+- https://github.com/Sandhu-Sahil/mango-tracking-sys: I have started to learn about the mango tracking system. I have also created a little project to get a better understanding of the blockchain and its consensus algorithms.
+
+- https://hyperledger-fabric.readthedocs.io/en/latest/test_network.html: Read the docs of Hyperledger Fabric. Created a network using the test network for deep learning of Raft Fabric.

@@ -92,3 +92,12 @@ Date: August 7, 2023 - August 11, 2023
 - https://github.com/Sandhu-Sahil/mango-tracking-sys: I have started to learn about the mango tracking system. I have also created a little project to get a better understanding of the blockchain and its consensus algorithms.
 
 - https://hyperledger-fabric.readthedocs.io/en/latest/test_network.html: Read the docs of Hyperledger Fabric. Created a network using the test network for deep learning of Raft Fabric.
+
+## Week 7
+
+```js
+Date: August 14, 2023 - August 18, 2023
+```
+- Read more about Croda, Raft, and Paxos. Read papers on Raft and Paxos about their working and implementation of main algorithm.
+
+- https://github.com/Sandhu-Sahil/raft-implementation: Sucessfully implemented Raft consensus algorithm in golang.

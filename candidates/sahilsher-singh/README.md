@@ -101,3 +101,5 @@ Date: August 14, 2023 - August 18, 2023
 - Read more about Croda, Raft, and Paxos. Read papers on Raft and Paxos about their working and implementation of main algorithm.
 
 - https://github.com/Sandhu-Sahil/raft-implementation: Sucessfully implemented Raft consensus algorithm in golang.
+
+- Test Results: https://sandhu-sahil.github.io/raft-implementation/

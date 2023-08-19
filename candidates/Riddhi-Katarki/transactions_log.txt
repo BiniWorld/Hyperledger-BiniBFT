@@ -1,0 +1,19 @@
+#Install Chaincode
+2023-08-11 17:54:11.739 IST 0001 INFO [cli.lifecycle.chaincode] submitInstallProposal -> Installed remotely: response:<status:200 payload:"\nHmango_1:5af17586d37e69f875edd2f8259144f1aef932615170320576ad8aae4d2f220\022\007mango_1" > 
+2023-08-11 17:54:11.740 IST 0002 INFO [cli.lifecycle.chaincode] submitInstallProposal -> Chaincode code package identifier: mango_1:5af12579d37e69f985edd2f8259164f1aef932615170320544ad1aae4d2f63d0
+
+#Approve Chaincode
+2023-08-11 17:00:41.182 IST 0001 INFO [chaincodeCmd] ClientWait -> txid [fab1bf99613fcbadc0537638e16ec776b51d1e0ae472d6a1be82ce8abd4beb20] committed with status (VALID) at producersorgpeer-api.127-0-0-1.nip.io:8080
+
+#Commit Chaincode
+2023-08-11 18:01:39.315 IST 0001 INFO [chaincodeCmd] ClientWait -> txid [73bc9ecd80ee1efbef639e110d02b11aac05618bd4243191c726d2643066b2d1] committed with status (VALID) at producersorgpeer-api.127-0-0-1.nip.io:8080
+
+#Upgrade chaincode
+2023-08-11 18:38:56.809 IST 0001 INFO [cli.lifecycle.chaincode] submitInstallProposal -> Installed remotely: response:<status:200 payload:"\nHmango_2:8aa4967cd1561b59d6c256ca9cf1d227ad05f7db8effaf312b330a3d750b47b8\022\007mango_2" > 
+2023-08-11 18:38:56.810 IST 0002 INFO [cli.lifecycle.chaincode] submitInstallProposal -> Chaincode code package identifier: mango_2:8aa4967cd1561b59d6c256ca9cf1d227ad05f7db8effaf312b330a3d750b47b8
+
+#create asset
+peer chaincode invoke -o orderer-api.127-0-0-1.nip.io:8080 --channelID mango-channel -n mango -c '{"function":"CreateMango","Args":["MANGO1","1","mango corp","5000","10000"]}'
+
+#Query
+peer chaincode query  -o orderer-api.127-0-0-1.nip.io:8080 --channelID mango-channel -n mango -c '{"function":"ReadMango","Args":["MANGO1"]}'

@@ -1,0 +1,4 @@
+Node 0 sent a message to Node 1: {LeaderID:1 Hash:0ad704adc1b03927e5c923e64df30fae170f90cc3c536097998fec50ab8f34a7 Request:{ClientID:1 Data:Transaction data Signature:Client signature}}
+Node 0 sent a message to Node 2: {LeaderID:1 Hash:0ad704adc1b03927e5c923e64df30fae170f90cc3c536097998fec50ab8f34a7 Request:{ClientID:1 Data:Transaction data Signature:Client signature}}
+Node 0 sent a message to Node 3: {LeaderID:1 Hash:0ad704adc1b03927e5c923e64df30fae170f90cc3c536097998fec50ab8f34a7 Request:{ClientID:1 Data:Transaction data Signature:Client signature}}
+Node 0 sent a message to Node 4: {LeaderID:1 Hash:0ad704adc1b03927e5c923e64df30fae170f90cc3c536097998fec50ab8f34a7 Request:{ClientID:1 Data:Transaction data Signature:Client signature}}

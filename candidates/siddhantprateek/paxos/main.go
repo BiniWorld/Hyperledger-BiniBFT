@@ -75,8 +75,9 @@ func (l *Learner) ReceiveAccepted(prop Proposal) bool {
 	l.accepted = append(l.accepted, prop)
 	if len(l.accepted) >= l.quorumSize {
 		return true
+	} else {
+		return false
 	}
-	return false
 }
 
 func (p *Proposer) Propose() {
@@ -157,7 +158,5 @@ func main() {
 	}
 
 	// Simulate external input triggering proposals
-	// In a real system, this would be based on actual events or decisions
-	// For simplicity, we'll just wait here
 	select {}
 }

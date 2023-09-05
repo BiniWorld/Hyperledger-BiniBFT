@@ -1,0 +1,8 @@
+FROM golang:1.16 AS build
+WORKDIR /app
+COPY . .
+RUN go build -o paxos .
+FROM alpine:latest
+WORKDIR /app
+COPY --from=build /app/paxos .
+CMD ["./paxos"]

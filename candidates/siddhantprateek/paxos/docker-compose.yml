@@ -1,0 +1,8 @@
+version: '3.9'
+
+services:
+  paxos:
+    build:
+      context: .
+      dockerfile: Dockerfile.paxos 
+  

@@ -197,6 +197,86 @@ func (c *Node) getCommServer() *http3.Server {
 	}
 }
 
+// AssembleProposal creates a block proposal from transaction requests
+func (n *Node) AssembleProposal(metadata []byte, requests [][]byte) *consensus.Proposal {
+	n.logger.Info("Node assembling proposal", "nodeID", n.id, "requestCount", len(requests))
+
+	// Convert raw request bytes to transactions
+	var transactions []Transaction
+	for _, reqBytes := range requests {
+		// Try to deserialize as Transaction first
+		if tx := TransactionFromBytes(reqBytes); tx != nil {
+			transactions = append(transactions, *tx)
+		} else {
+			// If not a transaction, create one from the raw data
+			txID := uuid.New().String()
+			tx := Transaction{
+				ClientID: "system",
+				Data:     string(reqBytes),
+				TS:       int(time.Now().UnixNano() / 1000000),
+				ID:       txID,
+			}
+			transactions = append(transactions, tx)
+		}
+	}
+
+	// Create block data from transactions
+	var txBytes [][]byte
+	for _, tx := range transactions {
+		txBytes = append(txBytes, tx.ToBytes())
+	}
+
+	blockData := BlockData{Transactions: txBytes}
+
+	// Create block header
+	header := BlockHeader{
+		PrevHash: n.prevHash,
+		DataHash: computeDigest(blockData.ToBytes()),
+		Sequence: int64(time.Now().UnixNano()), // Use timestamp as sequence for now
+	}
+
+	// Create the proposal using consensus.Proposal type
+	proposal := &consensus.Proposal{
+		ID:        uuid.New().String(),
+		Data:      blockData.ToBytes(),
+		Timestamp: time.Now(),
+		ShardID:   n.shardId,
+		Proposer:  n.id,
+	}
+
+	n.logger.Info("Assembled proposal",
+		"proposalID", proposal.ID,
+		"transactions", len(transactions),
+		"dataHash", header.DataHash,
+		"sequence", header.Sequence)
+
+	return proposal
+}
+
+// ProcessRequestsIntoProposal processes multiple requests into a single proposal
+func (n *Node) ProcessRequestsIntoProposal(requests []*consensus.Request) *consensus.Proposal {
+	n.logger.Info("Processing requests into proposal", "nodeID", n.id, "requestCount", len(requests))
+
+	// Convert requests to raw bytes for AssembleProposal
+	var requestBytes [][]byte
+	for _, req := range requests {
+		requestBytes = append(requestBytes, req.Data)
+	}
+
+	// Create metadata with request information
+	metadata := map[string]interface{}{
+		"timestamp":    time.Now(),
+		"nodeID":       n.id,
+		"shardID":      n.shardId,
+		"requestCount": len(requests),
+	}
+
+	metadataBytes, _ := json.Marshal(metadata)
+
+	// Use AssembleProposal to create the proposal
+	return n.AssembleProposal(metadataBytes, requestBytes)
+}
+
 func (n *Node) getOperationsServer() *http.Server {
 	muxOps := gin.Default()
 	muxOps.GET("/stop", func(ctx *gin.Context) {
@@ -222,7 +302,7 @@ func (n *Node) getOperationsServer() *http.Server {
 		height := 0
 		block, err := n.storage.GetLatestBlock()
 		if err == nil {
-			height = int(block.Height)
+			height = int(block.Sequence)
 		}
 
 		// Get consensus status for additional information
@@ -316,7 +396,7 @@ func (n *Node) getOperationsServer() *http.Server {
 			ctx.JSON(500, gin.H{"error": "No blocks found", "height": 0})
 			return
 		}
-		ctx.JSON(200, gin.H{"height": block.Height})
+		ctx.JSON(200, gin.H{"height": block.Sequence})
 		return
 	})
 	muxOps.GET("/blocks/:blockNumber", func(ctx *gin.Context) {

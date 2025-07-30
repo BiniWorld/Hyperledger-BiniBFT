@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"context"
+	"encoding/asn1"
 	"fmt"
 	"sync"
 	"time"
@@ -64,26 +65,84 @@ type Decision struct {
 
 // Transaction represents a transaction within a block
 type Transaction struct {
-	ID        string    `json:"id"`
-	From      string    `json:"from"`
-	To        string    `json:"to"`
-	Amount    uint64    `json:"amount"`
-	Data      []byte    `json:"data"`
-	Timestamp time.Time `json:"timestamp"`
-	Signature []byte    `json:"signature"`
+	ClientID string `json:"clientID"`
+	TS       int    `json:"ts"`
+	ID       string `json:"id"`
+	Data     string `json:"data"`
 }
 
 // Block represents a block containing transactions
 type Block struct {
-	ID           string        `json:"id"`
-	PreviousHash string        `json:"previous_hash"`
-	Hash         string        `json:"hash"`
-	Height       uint64        `json:"height"`
-	Timestamp    time.Time     `json:"timestamp"`
+	Sequence     int64         `json:"sequence"`
+	PrevHash     string        `json:"prevHash"`
+	Metadata     []byte        `json:"metadata"`
 	Transactions []Transaction `json:"transactions"`
-	ProposalID   string        `json:"proposal_id"`
-	Proposer     NodeID        `json:"proposer"`
-	Signature    []byte        `json:"signature"`
+}
+
+func (block Block) ToBytes() []byte {
+	rawHeader, err := asn1.Marshal(block)
+	if err != nil {
+		panic(err)
+	}
+	return rawHeader
+}
+
+func BlockFromBytes(rawHeader []byte) *Block {
+	var block Block
+	asn1.Unmarshal(rawHeader, &block)
+	return &block
+}
+
+func (txn Transaction) ToBytes() []byte {
+	rawTxn, err := asn1.Marshal(txn)
+	if err != nil {
+		panic(err)
+	}
+	return rawTxn
+}
+
+func TransactionFromBytes(rawTxn []byte) *Transaction {
+	var txn Transaction
+	asn1.Unmarshal(rawTxn, &txn)
+	return &txn
+}
+
+type BlockHeader struct {
+	Sequence int64
+	PrevHash string
+	DataHash string
+}
+
+func (header BlockHeader) ToBytes() []byte {
+	rawHeader, err := asn1.Marshal(header)
+	if err != nil {
+		panic(err)
+	}
+	return rawHeader
+}
+
+func BlockHeaderFromBytes(rawHeader []byte) *BlockHeader {
+	var header BlockHeader
+	asn1.Unmarshal(rawHeader, &header)
+	return &header
+}
+
+type BlockData struct {
+	Transactions [][]byte
+}
+
+func (b BlockData) ToBytes() []byte {
+	rawBlock, err := asn1.Marshal(b)
+	if err != nil {
+		panic(err)
+	}
+	return rawBlock
+}
+
+func BlockDataFromBytes(rawBlock []byte) *BlockData {
+	var block BlockData
+	asn1.Unmarshal(rawBlock, &block)
+	return &block
 }
 
 // Config holds the configuration for the consensus instance

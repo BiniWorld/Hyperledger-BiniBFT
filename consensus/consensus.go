@@ -517,54 +517,66 @@ func (hc *Consensus) HandleMessage(from NodeID, message Message) error {
 	return nil
 }
 
-// storeProposalAsBlock stores a committed proposal as a block in storage
+// storeProposalAsBlock stores a committed proposal as a block using the provided types
 func (hc *Consensus) storeProposalAsBlock(proposal *Proposal, batchID string) {
-	// Get the latest block to determine the height and previous hash
-	var height uint64 = 1
+	// Get the latest block to determine the sequence and previous hash
+	var sequence int64 = 1
 	var prevHash string
 
-	latestBlock, err := hc.config.Storage.GetLatestBlock()
-	if err == nil && latestBlock != nil {
-		height = latestBlock.Height + 1
-		prevHash = latestBlock.Hash
-	}
-
-	// Extract transactions from proposal data
-	var transactions []Transaction
-	if err := json.Unmarshal(proposal.Data, &transactions); err != nil {
-		// If the data is not a transaction array, create a single transaction
-		tx := Transaction{
-			ID:        fmt.Sprintf("tx-%s", proposal.ID),
-			Timestamp: proposal.Timestamp,
-			Data:      proposal.Data,
+	// Try to get latest block from storage
+	if hc.config.Storage != nil {
+		if latestBlock, err := hc.config.Storage.GetLatestBlock(); err == nil {
+			sequence = latestBlock.Sequence + 1
+			prevHash = fmt.Sprintf("%x", sha256.Sum256(latestBlock.ToBytes()))
 		}
-		transactions = []Transaction{tx}
 	}
 
-	// Create a new block
-	block := &Block{
-		ID:           proposal.ID,
-		PreviousHash: prevHash,
-		Height:       height,
-		Timestamp:    time.Now(),
-		Transactions: transactions,
-		ProposalID:   proposal.ID,
-		Proposer:     proposal.Proposer,
-	}
-
-	// Calculate block hash (simplified for example)
-	blockData, _ := json.Marshal(block)
-	block.Hash = fmt.Sprintf("%x", sha256.Sum256(blockData))
-
-	// Store the block
-	if err := hc.config.Storage.StoreBlock(block); err != nil {
-		hc.config.Logger.Error("Failed to store block", "error", err, "blockID", block.ID)
+	// Extract transaction from proposal data
+	var transaction Transaction
+	if len(proposal.Data) > 0 {
+		// Try to unmarshal as Transaction first
+		if txn := TransactionFromBytes(proposal.Data); txn != nil {
+			transaction = *txn
+		} else {
+			// Create transaction from proposal data
+			transaction = Transaction{
+				ClientID: "system",
+				TS:       int(time.Now().UnixNano() / 1000000),
+				ID:       proposal.ID,
+				Data:     string(proposal.Data),
+			}
+		}
 	} else {
+		// Create minimal transaction
+		transaction = Transaction{
+			ClientID: "system",
+			TS:       int(time.Now().UnixNano() / 1000000),
+			ID:       proposal.ID,
+			Data:     "committed",
+		}
+	}
+
+	// Create block using the updated Block type
+	block := &Block{
+		Sequence:     sequence,
+		PrevHash:     prevHash,
+		Metadata:     []byte(fmt.Sprintf(`{"proposer":"%s","batchID":"%s"}`, proposal.Proposer, batchID)),
+		Transactions: []Transaction{transaction},
+	}
+
+	// Store block using the storage interface
+	if hc.config.Storage != nil {
+		if err := hc.config.Storage.StoreBlock(block); err != nil {
+			hc.config.Logger.Error("Failed to store block", "error", err, "sequence", sequence)
+			return
+		}
+
 		hc.config.Logger.Info("Block stored successfully",
-			"blockID", block.ID,
-			"height", block.Height,
+			"sequence", block.Sequence,
+			"prevHash", prevHash,
 			"transactions", len(block.Transactions),
-			"batchID", batchID)
+			"batchID", batchID,
+			"nodeID", hc.config.NodeID)
 	}
 }
 
@@ -590,9 +602,9 @@ func (hc *Consensus) handleRequest(request *Request) {
 		// Shard leaders always forward to primary leader first (even for their own shard)
 		hc.forwardToPrimaryLeader(request)
 	case RolePrimaryLeader:
-		// Primary leader starts binibft consensus directly with shard leaders
-		hc.config.Logger.Info("Primary leader received request, starting binibft consensus", "requestID", request.ID, "clientID", request.ClientID)
-		hc.startConsensusAtShardLeaders(request)
+		// Primary leader batches requests for processing
+		hc.config.Logger.Info("Primary leader received request, adding to batch", "requestID", request.ID, "clientID", request.ClientID)
+		hc.processBatchedRequests()
 	}
 }
 
@@ -611,6 +623,22 @@ func (hc *Consensus) forwardToPrimaryLeader(request *Request) {
 	hc.config.Logger.Debug("Forwarded request to primary leader", "requestID", request.ID)
 }
 
+// processBatchedRequests processes requests in batches at the primary leader
+func (hc *Consensus) processBatchedRequests() {
+	// Get all pending requests from the pool
+	allRequests := hc.requestPool.GetRequestsByPhase(PhasePrePrep)
+
+	if len(allRequests) == 0 {
+		return
+	}
+
+	// For now, process requests individually (can be enhanced to true batching later)
+	for _, request := range allRequests {
+		hc.config.Logger.Info("Processing batched request", "requestID", request.ID)
+		hc.startConsensusAtShardLeaders(request)
+	}
+}
+
 // handlePrePrep processes pre-preparation messages
 func (hc *Consensus) handlePrePrep(prePrepMsg *PrePrepMessage) {
 	hc.mu.Lock()
@@ -623,23 +651,6 @@ func (hc *Consensus) handlePrePrep(prePrepMsg *PrePrepMessage) {
 	}
 
 	hc.config.Logger.Info("Handling pre-prep", "requestID", prePrepMsg.RequestID, "from", prePrepMsg.NodeID, "role", hc.config.Role.String())
-
-	// Create and add request to pool if it doesn't exist
-	if _, exists := hc.requestPool.GetRequest(prePrepMsg.RequestID); !exists {
-		// Create a new request based on the pre-prep message
-		request := &Request{
-			ID:        prePrepMsg.RequestID,
-			Data:      prePrepMsg.Digest, // Use digest as data
-			ClientID:  "client",          // Default client ID
-			Timestamp: time.Now(),
-			Phase:     PhasePrePrep,
-			ShardID:   prePrepMsg.ShardID,
-		}
-
-		// Add to request pool
-		hc.requestPool.AddRequest(request)
-		hc.config.Logger.Info("Added request to pool from pre-prep", "requestID", prePrepMsg.RequestID)
-	}
 
 	// Store pre-prep message
 	if _, exists := hc.prePrepMessages[prePrepMsg.RequestID]; !exists {
@@ -1506,52 +1517,63 @@ func (hc *Consensus) finalizeRequestAndCreateBlock(requestID string) {
 		return
 	}
 
-	request, exists := hc.requestPool.GetRequest(requestID)
-	if !exists {
-		hc.config.Logger.Error("Request not found for finalization", "requestID", requestID, "poolSize", hc.requestPool.Size())
-		return
-	}
-
-	hc.config.Logger.Info("Found request for finalization", "requestID", requestID, "phase", request.Phase.String())
-
 	// Mark as finalized to prevent duplicates
 	hc.finalizedRequests[requestID] = true
 
-	// Record metrics for decision reached and commit latency
-	hc.metrics.RecordDecisionReached()
-	if !request.Timestamp.IsZero() {
-		hc.metrics.RecordCommitLatency(time.Since(request.Timestamp))
-		hc.metrics.RecordShardConsensusTime(request.ShardID, time.Since(request.Timestamp))
-	}
+	// Try to get request from pool (only available on hot node and primary leader)
+	request, exists := hc.requestPool.GetRequest(requestID)
+	if exists {
+		hc.config.Logger.Info("Found request for finalization", "requestID", requestID, "phase", request.Phase.String())
 
-	// Convert request to proposal and directly create block
-	proposal := &Proposal{
-		ID:        requestID,
-		Data:      request.Data,
-		Timestamp: time.Now(),
-		ShardID:   request.ShardID,
-		Proposer:  hc.config.NodeID,
-	}
+		// Record metrics for decision reached and commit latency
+		hc.metrics.RecordDecisionReached()
+		if !request.Timestamp.IsZero() {
+			hc.metrics.RecordCommitLatency(time.Since(request.Timestamp))
+			hc.metrics.RecordShardConsensusTime(request.ShardID, time.Since(request.Timestamp))
+		}
 
-	// Directly create and store block in ALL nodes
-	if hc.config.Storage != nil {
-		hc.storeProposalAsBlock(proposal, "")
-		hc.config.Logger.Info("Block created and stored for finalized request",
-			"requestID", requestID,
-			"nodeID", hc.config.NodeID,
-			"role", hc.config.Role.String())
+		// Convert request to proposal and directly create block
+		proposal := &Proposal{
+			ID:        requestID,
+			Data:      request.Data,
+			Timestamp: request.Timestamp,
+			ShardID:   request.ShardID,
+			Proposer:  hc.config.NodeID,
+		}
+
+		// Create and store block
+		if hc.config.Storage != nil {
+			hc.storeProposalAsBlock(proposal, "")
+			hc.config.Logger.Info("Block created and stored for finalized request",
+				"requestID", requestID,
+				"nodeID", hc.config.NodeID,
+				"role", hc.config.Role.String())
+		}
+
+		// Clean up request from pool
+		hc.requestPool.RemoveRequest(requestID)
 	} else {
-		hc.config.Logger.Error("No storage configured, block not stored", "requestID", requestID)
+		// Request not in pool (normal for non-hot nodes and non-primary nodes)
+		hc.config.Logger.Info("Request not in local pool - creating minimal block", "requestID", requestID)
+
+		// Create minimal proposal for block creation
+		proposal := &Proposal{
+			ID:        requestID,
+			Data:      []byte("committed"), // Minimal data since we don't have the original
+			Timestamp: time.Now(),
+			ShardID:   0, // Default shard
+			Proposer:  hc.config.NodeID,
+		}
+
+		// Create and store block
+		if hc.config.Storage != nil {
+			hc.storeProposalAsBlock(proposal, "")
+			hc.config.Logger.Info("Minimal block created and stored",
+				"requestID", requestID,
+				"nodeID", hc.config.NodeID,
+				"role", hc.config.Role.String())
+		}
 	}
-
-	// Clean up request from pool
-	hc.requestPool.RemoveRequest(requestID)
-
-	// Clean up message tracking
-	delete(hc.prePrepMessages, requestID)
-	// delete(hc.prepMessages, requestID)
-	delete(hc.prepareMessages, requestID)
-	delete(hc.commitMessages, requestID)
 
 	hc.config.Logger.Info("Request finalized and block created", "requestID", requestID, "nodeID", hc.config.NodeID)
 }

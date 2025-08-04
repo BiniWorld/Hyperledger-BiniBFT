@@ -4,8 +4,11 @@ import (
 	"binibft-poc/consensus"
 	"fmt"
 	"log/slog"
+	"math"
+	"math/rand"
 	"os"
 	"slices"
+	"strconv"
 	"time"
 )
 
@@ -20,7 +23,7 @@ type clusterConfig struct {
 }
 
 func main() {
-
+	shardMap := make(map[consensus.ShardID]Shard)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	numNodes := 5
 
@@ -30,18 +33,14 @@ func main() {
 		BatchTimeout: 2 * time.Second,
 	}
 
+	primary, shards := generateShardsWithRandomAssignment(numNodes, 7)
+	for i, shard := range shards {
+		shardID := consensus.ShardID(i + 1) // Assuming ShardID is int-based
+		shardMap[shardID] = shard
+	}
 	clusterConfig := clusterConfig{
-		primaryId: "1", // Node 1 is the primary leader coordinating all shards
-		shards: map[consensus.ShardID]Shard{
-			1: {
-				LeaderId:  "2", // Node 2 leads shard 0
-				Followers: []consensus.NodeID{"3", "4", "5"},
-			},
-			// 1: {
-			// 	LeaderId:  "4", // Node 4 leads shard 1
-			// 	Followers: []consensus.NodeID{"5"},
-			// },
-		},
+		primaryId: primary,
+		shards:    shardMap,
 	}
 
 	chains := make(map[int]*Chain)
@@ -139,4 +138,92 @@ func main() {
 		chains[id] = chain
 	}
 	select {}
+}
+
+func calculateSecondaryLeaderCount(totalNodes int, maxSecondaryLeaders int) int {
+	remainingNodes := totalNodes - 1 // excluding primary
+
+	idealSecondaryLeaders := int(math.Min(float64(remainingNodes/7), float64(maxSecondaryLeaders)))
+	if idealSecondaryLeaders < 3 {
+		idealSecondaryLeaders = 3
+	}
+	if idealSecondaryLeaders%2 == 0 {
+		idealSecondaryLeaders++
+	}
+
+	const maxFollowersPerLeader = 9
+	for idealSecondaryLeaders > 1 {
+		availableFollowers := remainingNodes - idealSecondaryLeaders
+		if availableFollowers/idealSecondaryLeaders > maxFollowersPerLeader {
+			idealSecondaryLeaders--
+		} else {
+			break
+		}
+	}
+	return idealSecondaryLeaders
+}
+
+// Distributes followers evenly across leaders
+func distributeFollowers(numFollowers, numLeaders int) []int {
+	followersPerLeader := make([]int, numLeaders)
+	for i := range followersPerLeader {
+		followersPerLeader[i] = numFollowers / numLeaders
+	}
+	for i := 0; i < numFollowers%numLeaders; i++ {
+		followersPerLeader[i]++
+	}
+	return followersPerLeader
+}
+
+func generateRandomNodeIDs(total int) []consensus.NodeID {
+	nodes := make([]consensus.NodeID, total)
+	for i := 0; i < total; i++ {
+		nodes[i] = consensus.NodeID(strconv.Itoa(i + 1))
+	}
+	rand.Seed(time.Now().UnixNano())
+	rand.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+	return nodes
+}
+
+func generateShardsWithRandomAssignment(totalNodes int, maxSecondaryLeaders int) (consensus.NodeID, []Shard) {
+	if totalNodes < 4 {
+		panic("Need at least 4 nodes (1 primary + 3 secondary leaders) to form shards")
+	}
+	if maxSecondaryLeaders > totalNodes-1 {
+		maxSecondaryLeaders = totalNodes - 1
+	}
+
+	allNodes := generateRandomNodeIDs(totalNodes)
+	primaryLeader := allNodes[0]
+	remainingNodes := allNodes[1:]
+
+	numSecondaryLeaders := calculateSecondaryLeaderCount(totalNodes, maxSecondaryLeaders)
+
+	if numSecondaryLeaders >= len(remainingNodes) {
+		panic("Not enough nodes to assign as secondary leaders")
+	}
+
+	secondaryLeaders := remainingNodes[:numSecondaryLeaders]
+	followerPool := remainingNodes[numSecondaryLeaders:]
+	numFollowers := len(followerPool)
+
+	followersPerLeader := distributeFollowers(numFollowers, numSecondaryLeaders)
+
+	shards := make([]Shard, numSecondaryLeaders)
+	currentIndex := 0
+
+	for i := 0; i < numSecondaryLeaders; i++ {
+		numFollowers := followersPerLeader[i]
+		endIndex := currentIndex + numFollowers
+		if endIndex > len(followerPool) {
+			panic(fmt.Sprintf("Trying to assign %d followers, but only %d available", numFollowers, len(followerPool)-currentIndex))
+		}
+		shards[i] = Shard{
+			LeaderId:  secondaryLeaders[i],
+			Followers: followerPool[currentIndex:endIndex],
+		}
+		currentIndex = endIndex
+	}
+
+	return primaryLeader, shards
 }

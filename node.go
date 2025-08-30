@@ -104,6 +104,7 @@ func NewNode(
 	builder.WithStorage(storage) // Add storage configuration
 	builder.WithPrimaryLeader(primaryId)
 	builder.WithNode(id, shardId, role)
+	builder.WithBatchingConfig(int(opts.BatchSize), opts.BatchTimeout)
 
 	// Configure ALL shards for cross-shard coordination using the cluster config
 	// This is needed so the primary leader knows about all shard leaders

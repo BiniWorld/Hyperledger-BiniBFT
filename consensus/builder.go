@@ -20,7 +20,7 @@ func NewConsensusBuilder() *ConsensusBuilder {
 			ShardNodes:             make(map[ShardID][]NodeID),
 			ShardLeaders:           make(map[ShardID]NodeID),
 			ShardMajorityThreshold: 0.67,
-			CrossShardThreshold:    0.67,
+			CrossShardThreshold:    0.51,
 			Timeout:                5 * time.Second,
 			ViewChangeTimeout:      30 * time.Second,
 			BatchSize:              10,

@@ -33,7 +33,7 @@ func main() {
 		BatchTimeout: 2 * time.Second,
 	}
 
-	primary, shards := generateShardsWithRandomAssignment(numNodes, 7)
+	primary, shards := generateShardsWithRandomAssignment(numNodes, 2)
 	for i, shard := range shards {
 		shardID := consensus.ShardID(i + 1) // Assuming ShardID is int-based
 		shardMap[shardID] = shard

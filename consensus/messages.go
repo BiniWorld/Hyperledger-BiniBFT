@@ -88,13 +88,14 @@ type RequestMessage struct {
 
 // PrePrepMessage for pre-preparation phase
 type PrePrepMessage struct {
-	RequestID string
-	View      uint64
-	Sequence  uint64
-	Digest    []byte
-	NodeID    NodeID
-	ShardID   ShardID
-	Signature []byte
+	RequestID       string
+	View            uint64
+	Sequence        uint64
+	Digest          []byte
+	NodeID          NodeID
+	ShardID         ShardID
+	Signature       []byte
+	BatchRequestIDs []string // For batched requests
 }
 
 // PrepMessage for preparation phase

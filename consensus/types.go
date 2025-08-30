@@ -3,6 +3,7 @@ package consensus
 import (
 	"context"
 	"encoding/asn1"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
@@ -80,7 +81,7 @@ type Block struct {
 }
 
 func (block Block) ToBytes() []byte {
-	rawHeader, err := asn1.Marshal(block)
+	rawHeader, err := json.Marshal(block)
 	if err != nil {
 		panic(err)
 	}
@@ -89,12 +90,12 @@ func (block Block) ToBytes() []byte {
 
 func BlockFromBytes(rawHeader []byte) *Block {
 	var block Block
-	asn1.Unmarshal(rawHeader, &block)
+	json.Unmarshal(rawHeader, &block)
 	return &block
 }
 
 func (txn Transaction) ToBytes() []byte {
-	rawTxn, err := asn1.Marshal(txn)
+	rawTxn, err := json.Marshal(txn)
 	if err != nil {
 		panic(err)
 	}
@@ -103,7 +104,7 @@ func (txn Transaction) ToBytes() []byte {
 
 func TransactionFromBytes(rawTxn []byte) *Transaction {
 	var txn Transaction
-	asn1.Unmarshal(rawTxn, &txn)
+	json.Unmarshal(rawTxn, &txn)
 	return &txn
 }
 

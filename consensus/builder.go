@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"binibft-poc/consensus/protos"
 	"fmt"
 	"log/slog"
 	"os"
@@ -83,11 +84,12 @@ func (b *ConsensusBuilder) WithNetwork(network NetworkInterface) *ConsensusBuild
 }
 
 // WithStorage sets the block storage
-func (b *ConsensusBuilder) WithStorage(storage BlockStorage) *ConsensusBuilder {
+func (b *ConsensusBuilder) WithStorage(walStorage, storage BlockStorage) *ConsensusBuilder {
 	if b.err != nil {
 		return b
 	}
 
+	b.config.WalStorage = storage
 	b.config.Storage = storage
 
 	return b
@@ -163,14 +165,9 @@ func (b *ConsensusBuilder) WithBatchingConfig(batchSize int, maxDelay time.Durat
 	if b.err != nil {
 		return b
 	}
-
-	if batchSize < 1 {
-		b.err = fmt.Errorf("batch size must be at least 1")
-		return b
-	}
-
-	b.config.BatchSize = batchSize
-	b.config.MaxBatchDelay = maxDelay
+	b.config.RequestBatchMaxBytes = 10 * 1024 * 1024
+	b.config.RequestBatchMaxCount = uint64(batchSize)
+	b.config.RequestBatchMaxInterval = maxDelay
 
 	return b
 }
@@ -184,6 +181,46 @@ func (b *ConsensusBuilder) WithBFTConfig(maxFaultyNodes int, signingKey []byte, 
 	b.config.MaxFaultyNodes = maxFaultyNodes
 	b.config.SigningKey = signingKey
 	b.config.VerificationKeys = verificationKeys
+
+	return b
+}
+
+func (b *ConsensusBuilder) WithViewMetaData(metadata *protos.ViewMetadata) *ConsensusBuilder {
+	if b.err != nil {
+		return b
+	}
+
+	b.config.Metadata = metadata
+
+	return b
+}
+
+func (b *ConsensusBuilder) WitAssembler(assembler Assembler) *ConsensusBuilder {
+	if b.err != nil {
+		return b
+	}
+
+	b.config.Assembler = assembler
+
+	return b
+}
+
+func (b *ConsensusBuilder) WithRequestInspector(reqInspector RequestInspector) *ConsensusBuilder {
+	if b.err != nil {
+		return b
+	}
+
+	b.config.RequestInspector = reqInspector
+
+	return b
+}
+
+func (b *ConsensusBuilder) WithApplication(app ApplicationDelivery) *ConsensusBuilder {
+	if b.err != nil {
+		return b
+	}
+
+	b.config.Application = app
 
 	return b
 }

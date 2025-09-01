@@ -2,6 +2,8 @@ package consensus
 
 import (
 	"fmt"
+	"log"
+	"strconv"
 	"sync"
 
 	"github.com/syndtr/goleveldb/leveldb"
@@ -68,36 +70,18 @@ func (s *LevelDBStorage) StoreBlock(block *Block) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Serialize block using ToBytes method
-	blockBytes := block.ToBytes()
-
-	// Store by sequence number
-	sequenceKey := fmt.Sprintf("%d", block.Sequence)
-	if err := s.db.Put([]byte(sequenceKey), blockBytes, nil); err != nil {
-		return fmt.Errorf("failed to store block by sequence: %w", err)
+	err := s.db.Put([]byte(strconv.FormatUint(uint64(block.Sequence), 10)), block.ToBytes(), &opt.WriteOptions{})
+	if err != nil {
+		log.Panicf("Error storing block: %v", err)
+	}
+	// set index for latest block
+	err = s.db.Put([]byte("latest_block"), block.ToBytes(), &opt.WriteOptions{})
+	if err != nil {
+		log.Panicf("Error storing latest block: %v", err)
 	}
 
-	// Store by height (same as sequence for compatibility)
-	heightKey := fmt.Sprintf("height:%020d", uint64(block.Sequence))
-	if err := s.db.Put([]byte(heightKey), []byte(sequenceKey), nil); err != nil {
-		return fmt.Errorf("failed to store block by height: %w", err)
-	}
-
-	// Update latest block
-	if s.latestBlock == nil || block.Sequence > s.latestBlock.Sequence {
-		s.latestBlock = block
-		if err := s.db.Put([]byte("latest_block"), blockBytes, nil); err != nil {
-			return fmt.Errorf("failed to update latest block: %w", err)
-		}
-	}
-
-	// Store transactions with references to the block
-	for _, tx := range block.Transactions {
-		txKey := []byte("tx:" + tx.ID)
-		if err := s.db.Put(txKey, []byte(sequenceKey), nil); err != nil {
-			return fmt.Errorf("failed to store transaction reference: %w", err)
-		}
-	}
+	// Update the in-memory cache
+	s.latestBlock = block
 
 	return nil
 }
@@ -120,14 +104,7 @@ func (s *LevelDBStorage) GetBlock(sequenceKey string) (*Block, error) {
 func (s *LevelDBStorage) GetBlockByHeight(height uint64) (*Block, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
-	heightKey := fmt.Sprintf("height:%020d", height)
-	sequenceKey, err := s.db.Get([]byte(heightKey), nil)
-	if err != nil {
-		return nil, fmt.Errorf("block height not found: %w", err)
-	}
-
-	return s.GetBlock(string(sequenceKey))
+	return s.GetBlock(strconv.FormatUint(height, 10))
 }
 
 // GetLatestBlock returns the latest block
@@ -136,7 +113,11 @@ func (s *LevelDBStorage) GetLatestBlock() (*Block, error) {
 	defer s.mu.RUnlock()
 
 	if s.latestBlock == nil {
-		return nil, fmt.Errorf("no blocks stored yet")
+		latestBlockBytes, err := s.db.Get([]byte("latest_block"), nil)
+		if err != nil {
+			return nil, fmt.Errorf("no latest block found: %w", err)
+		}
+		s.latestBlock = BlockFromBytes(latestBlockBytes)
 	}
 
 	return s.latestBlock, nil

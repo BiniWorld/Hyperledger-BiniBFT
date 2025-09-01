@@ -21,6 +21,7 @@ const (
 	MsgCommitRequest
 	MsgCrossShardRequest
 	MsgShardAck
+	MsgFinalizedBlock
 )
 
 // Message represents a consensus message
@@ -76,11 +77,6 @@ type HeartbeatMessage struct {
 	Timestamp time.Time
 }
 
-// BatchProposalMessage contains a batch of proposals
-type BatchProposalMessage struct {
-	Batch *ProposalBatch
-}
-
 // RequestMessage contains client request data
 type RequestMessage struct {
 	Request *Request
@@ -88,22 +84,21 @@ type RequestMessage struct {
 
 // PrePrepMessage for pre-preparation phase
 type PrePrepMessage struct {
-	RequestID       string
-	View            uint64
-	Sequence        uint64
-	Digest          []byte
-	NodeID          NodeID
-	ShardID         ShardID
-	Signature       []byte
-	BatchRequestIDs []string // For batched requests
+	Proposal  Proposal
+	View      uint64
+	Sequence  uint64
+	Digest    string
+	NodeID    NodeID
+	ShardID   ShardID
+	Signature []byte
 }
 
 // PrepMessage for preparation phase
 type PrepMessage struct {
-	RequestID string
+	Proposal  Proposal
 	View      uint64
 	Sequence  uint64
-	Digest    []byte
+	Digest    string
 	NodeID    NodeID
 	ShardID   ShardID
 	Signature []byte
@@ -111,10 +106,10 @@ type PrepMessage struct {
 
 // PreparePhaseMessage for prepare phase
 type PreparePhaseMessage struct {
-	RequestID string
+	Proposal  Proposal
 	View      uint64
 	Sequence  uint64
-	Digest    []byte
+	Digest    string
 	NodeID    NodeID
 	ShardID   ShardID
 	Signature []byte
@@ -122,10 +117,10 @@ type PreparePhaseMessage struct {
 
 // CommitRequestMessage for commit phase
 type CommitRequestMessage struct {
-	RequestID string
+	Proposal  Proposal
 	View      uint64
 	Sequence  uint64
-	Digest    []byte
+	Digest    string
 	NodeID    NodeID
 	ShardID   ShardID
 	Signature []byte
@@ -141,10 +136,19 @@ type CrossShardRequestMessage struct {
 
 // ShardAckMessage for shard acknowledgment
 type ShardAckMessage struct {
-	RequestID    string
+	Sequence     uint64
 	ShardID      ShardID
 	NodeID       NodeID
 	Acknowledged bool
 	Phase        string // "preprep", "prepare", "commit"
 	Timestamp    time.Time
+}
+
+// FinalizedBlockMessage for forwarding finalized blocks to followers
+type FinalizedBlockMessage struct {
+	Sequence  uint64
+	Proposal  Proposal
+	ShardID   ShardID
+	LeaderID  NodeID
+	Timestamp time.Time
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"binibft-poc/consensus"
+	"binibft-poc/consensus/protos"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang/protobuf/proto"
 	"github.com/google/uuid"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -33,7 +35,7 @@ type Node struct {
 	doneWG      sync.WaitGroup
 	prevHash    string
 	id          consensus.NodeID
-	deliverChan chan<- *Block
+	deliverChan chan<- *consensus.Block
 	consensus   *consensus.Consensus
 	address     string
 	in          Ingress
@@ -55,7 +57,7 @@ func NewNode(
 	address string,
 	opsAddress string,
 	mapNodes map[string]*NodeInfo,
-	deliverChan chan<- *Block,
+	deliverChan chan<- *consensus.Block,
 	logger consensus.Logger,
 	opts NetworkOptions,
 	nodeDir string,
@@ -69,6 +71,11 @@ func NewNode(
 ) *Node {
 
 	logger.Info("Node initialized WAL")
+	walstorage, err := consensus.NewLevelDBStorage(nodeDir)
+	if err != nil {
+		panic(fmt.Sprintf("Failed to create consensus storage: %v", err))
+	}
+
 	comm := &Communicator{
 		nodeId:            id,
 		mapNodes:          mapNodes,
@@ -96,15 +103,39 @@ func NewNode(
 		mapNodes:    mapNodes,
 		shardId:     shardId,
 		storage:     storage,
+		config:      clusterConfig,
+	}
+
+	metadata := &protos.ViewMetadata{
+		LatestSequence: 0,
+		ViewId:         0,
+	}
+	block, err := storage.GetLatestBlock()
+	if err == nil {
+		err = proto.Unmarshal(block.Metadata, metadata)
+		if err != nil {
+			logger.Info(fmt.Sprintf("Unable to unmarshal metadata, error: %v", err))
+		}
+		// Set prevHash from the latest block
+		node.prevHash = fmt.Sprintf("%x", sha256.Sum256(block.ToBytes()))
+		logger.Info("Node %d found latest block with sequence %v, prevHash: %s", id, metadata.LatestSequence, node.prevHash)
+	} else {
+		// Genesis block case - no previous hash
+		node.prevHash = ""
+		logger.Info("Node %d starting from genesis, no previous hash", id)
 	}
 
 	builder := consensus.NewConsensusBuilder()
 	builder.WithNetwork(comm)
 	builder.WithLogger(logger)
-	builder.WithStorage(storage) // Add storage configuration
+	builder.WithStorage(walstorage, storage) // Add storage configuration
 	builder.WithPrimaryLeader(primaryId)
 	builder.WithNode(id, shardId, role)
 	builder.WithBatchingConfig(int(opts.BatchSize), opts.BatchTimeout)
+	builder.WithViewMetaData(metadata)
+	builder.WitAssembler(node)
+	builder.WithRequestInspector(node)
+	builder.WithApplication(node) // Use the node as the application delivery interface
 
 	// Configure ALL shards for cross-shard coordination using the cluster config
 	// This is needed so the primary leader knows about all shard leaders
@@ -125,7 +156,6 @@ func NewNode(
 	return node
 }
 func (c *Node) getCommServer() *http3.Server {
-	// generate self-signed certificate for HTTP/3 server
 	tlsCert, err := generateSelfSignedCert()
 	if err != nil {
 		c.logger.Error("failed to generate self-signed certificate", "error", err)
@@ -144,14 +174,8 @@ func (c *Node) getCommServer() *http3.Server {
 			w.WriteHeader(500)
 			return
 		}
-		// Decode message
-		var message consensus.Message
-		if err := json.Unmarshal(request, &message); err != nil {
-			http.Error(w, "Failed to decode message", http.StatusBadRequest)
-			return
-		}
 
-		if err := c.consensus.HandleMessage(message.From, message); err != nil {
+		if err := c.consensus.SubmitRequest(request); err != nil {
 			http.Error(w, fmt.Sprintf("Failed to handle message: %v", err), http.StatusInternalServerError)
 			return
 		}
@@ -198,86 +222,6 @@ func (c *Node) getCommServer() *http3.Server {
 	}
 }
 
-// AssembleProposal creates a block proposal from transaction requests
-func (n *Node) AssembleProposal(metadata []byte, requests [][]byte) *consensus.Proposal {
-	n.logger.Info("Node assembling proposal", "nodeID", n.id, "requestCount", len(requests))
-
-	// Convert raw request bytes to transactions
-	var transactions []Transaction
-	for _, reqBytes := range requests {
-		// Try to deserialize as Transaction first
-		if tx := TransactionFromBytes(reqBytes); tx != nil {
-			transactions = append(transactions, *tx)
-		} else {
-			// If not a transaction, create one from the raw data
-			txID := uuid.New().String()
-			tx := Transaction{
-				ClientID: "system",
-				Data:     string(reqBytes),
-				TS:       int(time.Now().UnixNano() / 1000000),
-				ID:       txID,
-			}
-			transactions = append(transactions, tx)
-		}
-	}
-
-	// Create block data from transactions
-	var txBytes [][]byte
-	for _, tx := range transactions {
-		txBytes = append(txBytes, tx.ToBytes())
-	}
-
-	blockData := BlockData{Transactions: txBytes}
-
-	// Create block header
-	header := BlockHeader{
-		PrevHash: n.prevHash,
-		DataHash: computeDigest(blockData.ToBytes()),
-		Sequence: int64(time.Now().UnixNano()), // Use timestamp as sequence for now
-	}
-
-	// Create the proposal using consensus.Proposal type
-	proposal := &consensus.Proposal{
-		ID:        uuid.New().String(),
-		Data:      blockData.ToBytes(),
-		Timestamp: time.Now(),
-		ShardID:   n.shardId,
-		Proposer:  n.id,
-	}
-
-	n.logger.Info("Assembled proposal",
-		"proposalID", proposal.ID,
-		"transactions", len(transactions),
-		"dataHash", header.DataHash,
-		"sequence", header.Sequence)
-
-	return proposal
-}
-
-// ProcessRequestsIntoProposal processes multiple requests into a single proposal
-func (n *Node) ProcessRequestsIntoProposal(requests []*consensus.Request) *consensus.Proposal {
-	n.logger.Info("Processing requests into proposal", "nodeID", n.id, "requestCount", len(requests))
-
-	// Convert requests to raw bytes for AssembleProposal
-	var requestBytes [][]byte
-	for _, req := range requests {
-		requestBytes = append(requestBytes, req.Data)
-	}
-
-	// Create metadata with request information
-	metadata := map[string]interface{}{
-		"timestamp":    time.Now(),
-		"nodeID":       n.id,
-		"shardID":      n.shardId,
-		"requestCount": len(requests),
-	}
-
-	metadataBytes, _ := json.Marshal(metadata)
-
-	// Use AssembleProposal to create the proposal
-	return n.AssembleProposal(metadataBytes, requestBytes)
-}
-
 func (n *Node) getOperationsServer() *http.Server {
 	muxOps := gin.Default()
 	muxOps.GET("/stop", func(ctx *gin.Context) {
@@ -309,19 +253,20 @@ func (n *Node) getOperationsServer() *http.Server {
 		// Get consensus status for additional information
 		consensusStatus := n.consensus.GetStatus()
 
-		// Determine shard leader based on node configuration
-		var shardLeader string
-		switch n.shardId {
-		case 0:
-			shardLeader = "2" // Node 2 is leader of shard 0
-		case 1:
-			shardLeader = "4" // Node 4 is leader of shard 1
-		default:
-			shardLeader = "unknown"
-		}
+		// Determine shard leader from cluster configuration
+		var shardLeader consensus.NodeID
+		var isShardLeader bool
 
-		// Determine if this node is the shard leader
-		isShardLeader := string(ownID) == shardLeader
+		if shard, exists := n.config.shards[n.shardId]; exists {
+			shardLeader = shard.LeaderId
+			isShardLeader = ownID == shardLeader
+		} else if n.shardId == 0 {
+			shardLeader = n.config.primaryId
+			isShardLeader = ownID == shardLeader
+		} else {
+			shardLeader = "unknown"
+			isShardLeader = false
+		}
 
 		ctx.JSON(200, gin.H{
 			"nodeID":        ownID,
@@ -368,16 +313,7 @@ func (n *Node) getOperationsServer() *http.Server {
 			ID:       txID,
 		}
 
-		// Create request for binibft consensus
-		request := &consensus.Request{
-			ID:        txID,
-			Data:      tx.ToBytes(),
-			ClientID:  txInput.ClientID,
-			Timestamp: time.Now(),
-			ShardID:   n.shardId,
-		}
-
-		err = n.consensus.SubmitRequest(request)
+		err = n.consensus.SubmitRequest(tx.ToBytes())
 		if err != nil {
 			c.JSON(500, gin.H{
 				"message": fmt.Sprintf("Error submitting request: %v", err),
@@ -398,7 +334,6 @@ func (n *Node) getOperationsServer() *http.Server {
 			return
 		}
 		ctx.JSON(200, gin.H{"height": block.Sequence})
-		return
 	})
 	muxOps.GET("/blocks/:blockNumber", func(ctx *gin.Context) {
 		blockNumberString := ctx.Param("blockNumber")
@@ -415,9 +350,7 @@ func (n *Node) getOperationsServer() *http.Server {
 			ctx.JSON(500, gin.H{"error": err})
 			return
 		}
-		// block := BlockFromBytes(blockBytes)
 		ctx.JSON(200, gin.H{"block": block})
-		return
 	})
 
 	return &http.Server{

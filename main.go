@@ -24,7 +24,10 @@ type clusterConfig struct {
 
 func main() {
 	shardMap := make(map[consensus.ShardID]Shard)
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		AddSource: false,
+		Level:     slog.LevelDebug,
+	}))
 	numNodes := 5
 
 	networkOpts := NetworkOptions{
@@ -38,6 +41,8 @@ func main() {
 		shardID := consensus.ShardID(i + 1) // Assuming ShardID is int-based
 		shardMap[shardID] = shard
 	}
+	fmt.Printf("primary: %v\n", primary)
+	fmt.Printf("shards: %v\n", shards)
 	clusterConfig := clusterConfig{
 		primaryId: primary,
 		shards:    shardMap,

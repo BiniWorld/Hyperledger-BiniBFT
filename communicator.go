@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"sync"
 	"time"
@@ -18,15 +17,30 @@ type Communicator struct {
 	nodeId            consensus.NodeID
 	mapNodes          map[string]*NodeInfo
 	cachedHttpClients map[consensus.NodeID]*http.Client
+	clientsMutex      sync.RWMutex
 	logger            consensus.Logger
 	handler           consensus.MessageHandler
 }
 
-func (c Communicator) getOrCreateClient(targetID consensus.NodeID) *http.Client {
+func (c *Communicator) getOrCreateClient(targetID consensus.NodeID) *http.Client {
+	// First, try to get the client with a read lock
+	c.clientsMutex.RLock()
 	http3Client, ok := c.cachedHttpClients[targetID]
+	c.clientsMutex.RUnlock()
+
 	if ok {
 		return http3Client
 	}
+
+	// If not found, acquire write lock and create new client
+	c.clientsMutex.Lock()
+	defer c.clientsMutex.Unlock()
+
+	// Double-check in case another goroutine created it while we were waiting
+	if http3Client, ok := c.cachedHttpClients[targetID]; ok {
+		return http3Client
+	}
+
 	rt := &http3.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -42,7 +56,7 @@ func (c Communicator) getOrCreateClient(targetID consensus.NodeID) *http.Client 
 }
 
 // Broadcast implements consensus.NetworkInterface.
-func (c Communicator) Broadcast(nodeIDs []consensus.NodeID, message consensus.Message) error {
+func (c *Communicator) Broadcast(nodeIDs []consensus.NodeID, message consensus.Message) error {
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(nodeIDs))
 
@@ -69,21 +83,20 @@ func (c Communicator) Broadcast(nodeIDs []consensus.NodeID, message consensus.Me
 }
 
 // RegisterHandler implements consensus.NetworkInterface.
-func (c Communicator) RegisterHandler(handler consensus.MessageHandler) {
+func (c *Communicator) RegisterHandler(handler consensus.MessageHandler) {
 	c.handler = handler
 }
 
 // Send implements consensus.NetworkInterface.
-func (c Communicator) Send(nodeID consensus.NodeID, message consensus.Message) error {
-	endpoint, exists := c.mapNodes[string(nodeID)]
-
+func (c *Communicator) Send(targetID consensus.NodeID, message consensus.Message) error {
+	endpoint, exists := c.mapNodes[string(targetID)]
 	if !exists {
-		return fmt.Errorf("node %s endpoint not found", nodeID)
+		return fmt.Errorf("node %s endpoint not found", targetID)
 	}
 
 	// Set message metadata
 	message.From = c.nodeId
-	message.To = nodeID
+	message.To = targetID
 	if message.Timestamp.IsZero() {
 		message.Timestamp = time.Now()
 	}
@@ -94,28 +107,45 @@ func (c Communicator) Send(nodeID consensus.NodeID, message consensus.Message) e
 		return fmt.Errorf("failed to encode message: %w", err)
 	}
 
-	http3Client := c.getOrCreateClient(nodeID)
+	http3Client := c.getOrCreateClient(targetID)
 	// Send HTTP/3 request to consensus endpoint for inter-node communication
 	url := fmt.Sprintf("https://%s/consensus", endpoint.Address)
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+	go func() {
+		resp, err := http3Client.Post(url, "application/json", bytes.NewBuffer(data))
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			c.logger.Info(fmt.Sprintf("Node %s sent transaction to node %s", c.nodeId, targetID))
+			return
+		}
+	}()
+
+	return nil
+}
+
+func (c *Communicator) SendTransaction(targetID consensus.NodeID, request []byte) error {
+	endpoint, exists := c.mapNodes[string(targetID)]
+	if !exists {
+		return fmt.Errorf("node %s endpoint not found", targetID)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
+	http3Client := c.getOrCreateClient(targetID)
+	c.logger.Info(fmt.Sprintf("node %s sending transaction to node %s address=%s", c.nodeId, targetID, endpoint.Address))
+	url := fmt.Sprintf("https://%s/transaction?id=%s", endpoint.Address, c.nodeId)
+	go func() {
+		resp, err := http3Client.Post(url, "application/octet-stream", bytes.NewBuffer(request))
+		if err != nil {
+			return
+		}
+		defer resp.Body.Close()
 
-	c.logger.Debug("Sending message", "to", nodeID, "type", message.Type, "endpoint", endpoint)
-
-	resp, err := http3Client.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send message: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to send message, status: %d, response: %s", resp.StatusCode, string(body))
-	}
-
+		if resp.StatusCode != http.StatusOK {
+			c.logger.Info(fmt.Sprintf("Node %s sent transaction to node %s", c.nodeId, targetID))
+			return
+		}
+	}()
 	return nil
 }

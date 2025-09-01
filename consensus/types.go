@@ -1,11 +1,13 @@
 package consensus
 
 import (
+	"binibft-poc/consensus/protos"
 	"context"
+	"crypto/sha256"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 )
 
@@ -39,11 +41,31 @@ type ShardID uint32
 
 // Proposal represents a consensus proposal
 type Proposal struct {
-	ID        string
-	Data      []byte
-	Timestamp time.Time
-	ShardID   ShardID
-	Proposer  NodeID
+	Payload              []byte
+	Header               []byte
+	Metadata             []byte
+	VerificationSequence int64 // int64 for asn1 marshaling
+}
+
+func (p Proposal) Digest() string {
+	rawBytes, err := asn1.Marshal(Proposal{
+		VerificationSequence: p.VerificationSequence,
+		Metadata:             p.Metadata,
+		Payload:              p.Payload,
+		Header:               p.Header,
+	})
+	if err != nil {
+		panic(fmt.Sprintf("failed marshaling proposal: %v", err))
+	}
+
+	return computeDigest(rawBytes)
+}
+
+func computeDigest(rawBytes []byte) string {
+	h := sha256.New()
+	h.Write(rawBytes)
+	digest := h.Sum(nil)
+	return hex.EncodeToString(digest)
 }
 
 // Vote represents a vote on a proposal
@@ -148,7 +170,18 @@ func BlockDataFromBytes(rawBlock []byte) *BlockData {
 
 // Config holds the configuration for the consensus instance
 type Config struct {
-	NodeID            NodeID
+	NodeID NodeID
+
+	RequestBatchMaxCount uint64
+	// RequestBatchMaxBytes is the maximal total size of requests in a batch, in bytes.
+	// This is also the maximal size of a request. A request batch that reaches this size is proposed immediately.
+	RequestBatchMaxBytes uint64
+	// RequestBatchMaxInterval is the maximal time interval a request batch is waiting before it is proposed.
+	// A request batch is accumulating requests until RequestBatchMaxInterval had elapsed from the time the batch was
+	// first created (i.e. the time the first request was added to it), or until it is of count RequestBatchMaxCount,
+	// or total size RequestBatchMaxBytes, which ever happens first.
+	RequestBatchMaxInterval time.Duration
+
 	ShardID           ShardID
 	Role              NodeRole
 	ShardNodes        map[ShardID][]NodeID
@@ -169,7 +202,13 @@ type Config struct {
 	BatchSize              int           // Number of proposals to batch together
 	MaxBatchDelay          time.Duration // Maximum time to wait before processing a batch
 	// Storage
-	Storage BlockStorage // Storage for blocks and transactions
+	Storage          BlockStorage // Storage for blocks and transactions
+	WalStorage       BlockStorage // Storage for blocks and transactions
+	Metadata         *protos.ViewMetadata
+	Assembler        Assembler
+	RequestInspector RequestInspector
+	// Application delivery interface
+	Application ApplicationDelivery
 }
 
 // ConsensusInterface defines the main consensus operations
@@ -185,6 +224,7 @@ type NetworkInterface interface {
 	Send(nodeID NodeID, message Message) error
 	Broadcast(nodeIDs []NodeID, message Message) error
 	RegisterHandler(handler MessageHandler)
+	SendTransaction(targetID NodeID, request []byte) error
 }
 
 // MessageHandler handles incoming messages
@@ -199,6 +239,11 @@ type Logger interface {
 	Debug(msg string, fields ...interface{})
 }
 
+// ApplicationDelivery interface for delivering finalized proposals to the application
+type ApplicationDelivery interface {
+	Deliver(proposal Proposal) error
+}
+
 // Status represents the current status of the consensus
 type Status struct {
 	Role         NodeRole
@@ -211,6 +256,16 @@ type Status struct {
 
 // ViewChange represents a view change request
 type ViewChange struct {
+	NewView   uint64
+	NodeID    NodeID
+	ShardID   ShardID
+	Reason    string
+	Timestamp time.Time
+	Signature []byte
+}
+
+// ViewChangeRequest represents a request to change views
+type ViewChangeRequest struct {
 	NewView   uint64
 	NodeID    NodeID
 	ShardID   ShardID
@@ -251,177 +306,14 @@ type Request struct {
 	ShardID   ShardID
 }
 
-// RequestPoolInterface defines the interface for request pools
-type RequestPoolInterface interface {
-	AddRequest(request *Request) error
-	GetRequest(requestID string) (*Request, bool)
-	RemoveRequest(requestID string) error
-	UpdateRequestPhase(requestID string, phase RequestPhase)
-	Size() int
-	Close()
-	GetRequestsByPhase(phase RequestPhase) []*Request
-}
-
-// RequestPool manages pending requests with enhanced features
-type RequestPool struct {
-	requests map[string]*Request
-	mu       sync.RWMutex
-	maxSize  int
-	timeouts map[string]*time.Timer
-	logger   Logger
-	closed   bool
-}
-
-// RequestPoolOptions for configuring the request pool
-type RequestPoolOptions struct {
-	MaxSize int
-	Logger  Logger
-}
-
-// NewRequestPool creates a new request pool
-func NewRequestPool() *RequestPool {
-	return NewRequestPoolWithOptions(RequestPoolOptions{
-		MaxSize: 10000, // Default max size
-	})
-}
-
-// NewRequestPoolWithOptions creates a new request pool with options
-func NewRequestPoolWithOptions(opts RequestPoolOptions) *RequestPool {
-	if opts.MaxSize <= 0 {
-		opts.MaxSize = 10000
-	}
-
-	return &RequestPool{
-		requests: make(map[string]*Request),
-		maxSize:  opts.MaxSize,
-		timeouts: make(map[string]*time.Timer),
-		logger:   opts.Logger,
-		closed:   false,
-	}
-}
-
-// AddRequest adds a request to the pool
-func (rp *RequestPool) AddRequest(request *Request) error {
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
-
-	if rp.closed {
-		return fmt.Errorf("request pool is closed")
-	}
-
-	if len(rp.requests) >= rp.maxSize {
-		return fmt.Errorf("request pool is full (max: %d)", rp.maxSize)
-	}
-
-	if _, exists := rp.requests[request.ID]; exists {
-		return fmt.Errorf("request %s already exists", request.ID)
-	}
-
-	rp.requests[request.ID] = request
-
-	// Set a timeout for the request (optional)
-	if rp.logger != nil {
-		rp.logger.Debug("Added request to pool", "requestID", request.ID, "phase", request.Phase.String())
-	}
-
-	return nil
-}
-
-// GetRequest retrieves a request from the pool
-func (rp *RequestPool) GetRequest(requestID string) (*Request, bool) {
-	rp.mu.RLock()
-	defer rp.mu.RUnlock()
-	req, exists := rp.requests[requestID]
-	return req, exists
-}
-
-// UpdateRequestPhase updates the phase of a request
-func (rp *RequestPool) UpdateRequestPhase(requestID string, phase RequestPhase) {
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
-	if req, exists := rp.requests[requestID]; exists {
-		oldPhase := req.Phase
-		req.Phase = phase
-		if rp.logger != nil {
-			rp.logger.Debug("Updated request phase", "requestID", requestID, "oldPhase", oldPhase.String(), "newPhase", phase.String())
-		}
-	}
-}
-
-// RemoveRequest removes a request from the pool
-func (rp *RequestPool) RemoveRequest(requestID string) error {
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
-
-	if _, exists := rp.requests[requestID]; !exists {
-		return fmt.Errorf("request %s not found", requestID)
-	}
-
-	delete(rp.requests, requestID)
-
-	// Clean up timeout if exists
-	if timer, exists := rp.timeouts[requestID]; exists {
-		timer.Stop()
-		delete(rp.timeouts, requestID)
-	}
-
-	if rp.logger != nil {
-		rp.logger.Debug("Removed request from pool", "requestID", requestID)
-	}
-
-	return nil
-}
-
-// Size returns the number of requests in the pool
-func (rp *RequestPool) Size() int {
-	rp.mu.RLock()
-	defer rp.mu.RUnlock()
-	return len(rp.requests)
-}
-
-// Close closes the request pool
-func (rp *RequestPool) Close() {
-	rp.mu.Lock()
-	defer rp.mu.Unlock()
-
-	rp.closed = true
-
-	// Stop all timers
-	for _, timer := range rp.timeouts {
-		timer.Stop()
-	}
-
-	// Clear all data
-	rp.requests = make(map[string]*Request)
-	rp.timeouts = make(map[string]*time.Timer)
-
-	if rp.logger != nil {
-		rp.logger.Debug("Request pool closed")
-	}
-}
-
-// GetRequestsByPhase returns all requests in a specific phase
-func (rp *RequestPool) GetRequestsByPhase(phase RequestPhase) []*Request {
-	rp.mu.RLock()
-	defer rp.mu.RUnlock()
-
-	var requests []*Request
-	for _, req := range rp.requests {
-		if req.Phase == phase {
-			requests = append(requests, req)
-		}
-	}
-	return requests
-}
-
 // PrepareMessage represents a prepare phase message
 type PrepareMessage struct {
-	View       uint64
-	Sequence   uint64
-	ProposalID string
-	Digest     []byte
-	NodeID     NodeID
-	Signature  []byte
+	Proposal  Proposal
+	View      uint64
+	Sequence  uint64
+	Digest    []byte
+	NodeID    NodeID
+	Signature []byte
 }
 
 // CommitPhaseMessage represents a commit phase message
@@ -432,4 +324,9 @@ type CommitPhaseMessage struct {
 	Digest     []byte
 	NodeID     NodeID
 	Signature  []byte
+}
+
+type RequestInfo struct {
+	ClientID string
+	ID       string
 }

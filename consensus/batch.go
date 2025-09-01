@@ -1,98 +1,97 @@
 package consensus
 
 import (
-	"fmt"
 	"sync"
 	"time"
 )
 
-// ProposalBatch represents a batch of proposals
-type ProposalBatch struct {
-	ID        string
-	Proposals []*Proposal
-	ShardID   ShardID
-	NodeID    NodeID
-	Timestamp time.Time
+type Batcher interface {
+	NextBatch() [][]byte
+	Close()
+	Closed() bool
+	Reset()
 }
 
-// BatchManager manages batching of proposals
-type BatchManager struct {
-	batchSize    int
-	maxDelay     time.Duration
-	nodeID       NodeID
-	shardID      ShardID
-	proposals    []*Proposal
-	mu           sync.Mutex
-	batchCh      chan *ProposalBatch
-	timer        *time.Timer
-	timerRunning bool
+// BatchBuilder implements Batcher
+type BatchBuilder struct {
+	pool          RequestPoolInterface
+	submittedChan chan struct{}
+	maxMsgCount   int
+	maxSizeBytes  uint64
+	batchTimeout  time.Duration
+	closeChan     chan struct{}
+	closeLock     sync.Mutex // Reset and Close may be called by different threads
 }
 
-// NewBatchManager creates a new batch manager
-func NewBatchManager(batchSize int, maxDelay time.Duration, nodeID NodeID, shardID ShardID) *BatchManager {
-	return &BatchManager{
-		batchSize: batchSize,
-		maxDelay:  maxDelay,
-		nodeID:    nodeID,
-		shardID:   shardID,
-		proposals: make([]*Proposal, 0, batchSize),
-		batchCh:   make(chan *ProposalBatch, 10),
+// NewBatchBuilder creates a new BatchBuilder
+func NewBatchBuilder(pool RequestPoolInterface, submittedChan chan struct{}, maxMsgCount uint64, maxSizeBytes uint64, batchTimeout time.Duration) *BatchBuilder {
+	b := &BatchBuilder{
+		pool:          pool,
+		submittedChan: submittedChan,
+		maxMsgCount:   int(maxMsgCount),
+		maxSizeBytes:  maxSizeBytes,
+		batchTimeout:  batchTimeout,
+		closeChan:     make(chan struct{}),
 	}
+	return b
 }
 
-// AddProposal adds a proposal to the batch
-func (bm *BatchManager) AddProposal(proposal *Proposal) {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-
-	// Add proposal to batch
-	bm.proposals = append(bm.proposals, proposal)
-
-	// Start timer if not already running
-	if !bm.timerRunning {
-		bm.timerRunning = true
-		bm.timer = time.AfterFunc(bm.maxDelay, bm.processBatch)
+// NextBatch returns the next batch of requests to be proposed.
+// The method returns as soon as the batch is full, in terms of request count or total size, or after a timeout.
+// The method may block.
+func (b *BatchBuilder) NextBatch() [][]byte {
+	currBatch, full := b.pool.NextRequests(b.maxMsgCount, b.maxSizeBytes, true)
+	if full {
+		// If batch is full, we need to actually take the requests (remove them from pool)
+		currBatch, _ = b.pool.NextRequests(b.maxMsgCount, b.maxSizeBytes, false)
+		return currBatch
 	}
 
-	// Process batch immediately if it's full
-	if len(bm.proposals) >= bm.batchSize {
-		if bm.timer != nil {
-			bm.timer.Stop()
+	timeout := time.After(b.batchTimeout)
+	for {
+		select {
+		case <-b.closeChan:
+			return nil
+		case <-timeout:
+			currBatch, _ = b.pool.NextRequests(b.maxMsgCount, b.maxSizeBytes, false)
+			return currBatch
+		case <-b.submittedChan:
+			// there is a possibility to extend the current batch
+			currBatch, full = b.pool.NextRequests(b.maxMsgCount, b.maxSizeBytes, true)
+			if full {
+				// If batch is full, we need to actually take the requests (remove them from pool)
+				currBatch, _ = b.pool.NextRequests(b.maxMsgCount, b.maxSizeBytes, false)
+				return currBatch
+			}
 		}
-		go bm.processBatch()
 	}
 }
 
-// processBatch processes the current batch
-func (bm *BatchManager) processBatch() {
-	bm.mu.Lock()
-	defer bm.mu.Unlock()
-
-	// Reset timer state
-	bm.timerRunning = false
-
-	// Skip if no proposals
-	if len(bm.proposals) == 0 {
+// Close closes the close channel to stop NextBatch
+func (b *BatchBuilder) Close() {
+	b.closeLock.Lock()
+	defer b.closeLock.Unlock()
+	select {
+	case <-b.closeChan:
 		return
+	default:
 	}
-
-	// Create batch
-	batch := &ProposalBatch{
-		ID:        fmt.Sprintf("batch-%d", time.Now().UnixNano()),
-		Proposals: bm.proposals,
-		ShardID:   bm.shardID,
-		NodeID:    bm.nodeID,
-		Timestamp: time.Now(),
-	}
-
-	// Reset proposals
-	bm.proposals = make([]*Proposal, 0, bm.batchSize)
-
-	// Send batch
-	bm.batchCh <- batch
+	close(b.closeChan)
 }
 
-// GetBatchChannel returns the batch channel
-func (bm *BatchManager) GetBatchChannel() <-chan *ProposalBatch {
-	return bm.batchCh
+// Closed returns true if the batcher is closed
+func (b *BatchBuilder) Closed() bool {
+	select {
+	case <-b.closeChan:
+		return true
+	default:
+		return false
+	}
+}
+
+// Reset reopens the close channel to allow calling NextBatch
+func (b *BatchBuilder) Reset() {
+	b.closeLock.Lock()
+	defer b.closeLock.Unlock()
+	b.closeChan = make(chan struct{})
 }

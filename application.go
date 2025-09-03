@@ -5,6 +5,7 @@ import (
 	"binibft-poc/consensus/protos"
 	"crypto/sha256"
 	"fmt"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -32,6 +33,7 @@ func (n *Node) Deliver(proposal consensus.Proposal) error {
 			ID:       txn.ID,
 			Data:     txn.Data,
 		})
+		metrix[txn.ID].EndTime = time.Now()
 	}
 
 	// Extract block header information
@@ -70,6 +72,5 @@ func (n *Node) Deliver(proposal consensus.Proposal) error {
 	n.logger.Info("Application delivery completed successfully",
 		"nodeID", n.id,
 		"sequence", block.Sequence)
-
 	return nil
 }

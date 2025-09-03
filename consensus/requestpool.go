@@ -124,6 +124,9 @@ func (rp *RequestPool) Submit(request []byte) error {
 		return rp.network.SendTransaction(rp.primaryLeader, request)
 	}
 
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+
 	if uint64(len(rp.requests)) >= rp.maxSize {
 		return fmt.Errorf(
 			"submitted request (%d) is bigger than request max bytes (%d)",
@@ -132,10 +135,8 @@ func (rp *RequestPool) Submit(request []byte) error {
 		)
 	}
 
-	rp.mu.RLock()
 	_, alreadyExists := rp.existMap[reqInfo]
 	_, alreadyDelete := rp.delMap[reqInfo]
-	rp.mu.RUnlock()
 
 	if alreadyExists {
 		rp.logger.Debug("request already exists in the pool", "reqInfo", reqInfo)
@@ -156,8 +157,16 @@ func (rp *RequestPool) Submit(request []byte) error {
 	element := rp.fifo.PushBack(reqItem)
 	rp.existMap[reqInfo] = element
 
+	// Verify consistency after adding
 	if len(rp.existMap) != rp.fifo.Len() {
-		rp.logger.Error("RequestPool map and list are of different length", "map", len(rp.existMap), "list", rp.fifo.Len())
+		rp.logger.Error("RequestPool map and list are of different length after adding",
+			"map", len(rp.existMap),
+			"list", rp.fifo.Len(),
+			"reqInfo", reqInfo)
+		// Try to fix the inconsistency by removing the element we just added
+		rp.fifo.Remove(element)
+		delete(rp.existMap, reqInfo)
+		return fmt.Errorf("internal consistency error in request pool")
 	}
 
 	rp.logger.Debug("Request submitted to local pool", "reqInfo", reqInfo, "nodeID", rp.nodeID)
@@ -268,6 +277,7 @@ func (rp *RequestPool) NextRequests(maxCount int, maxSizeBytes uint64, check boo
 	var totalSize uint64
 	batch = make([][]byte, 0, count)
 	var elementsToRemove []*list.Element
+	var requestInfosToRemove []RequestInfo
 	element := rp.fifo.Front()
 
 	for i := 0; i < count && element != nil; i++ {
@@ -284,16 +294,30 @@ func (rp *RequestPool) NextRequests(maxCount int, maxSizeBytes uint64, check boo
 		// If this is not just a check, mark element for removal
 		if !check {
 			elementsToRemove = append(elementsToRemove, element)
+			reqInfo := rp.inspector.RequestID(req)
+			requestInfosToRemove = append(requestInfosToRemove, reqInfo)
 		}
 
 		element = element.Next()
 	}
 
-	// Remove elements from FIFO if this was not just a check
+	// Remove elements from FIFO and existMap if this was not just a check
 	if !check {
-		for _, elem := range elementsToRemove {
+		for i, elem := range elementsToRemove {
 			rp.fifo.Remove(elem)
 			rp.sizeBytes -= uint64(len(elem.Value.(*requestItem).request))
+
+			// Also remove from existMap and add to delMap to maintain consistency
+			reqInfo := requestInfosToRemove[i]
+			delete(rp.existMap, reqInfo)
+			rp.delMap[reqInfo] = struct{}{}
+		}
+
+		// Verify consistency after removal
+		if len(rp.existMap) != rp.fifo.Len() {
+			rp.logger.Error("RequestPool map and list are of different length after removal",
+				"map", len(rp.existMap),
+				"list", rp.fifo.Len())
 		}
 	}
 

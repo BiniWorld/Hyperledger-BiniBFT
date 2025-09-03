@@ -22,6 +22,8 @@ const (
 	MsgCrossShardRequest
 	MsgShardAck
 	MsgFinalizedBlock
+	MsgIntraShardVote
+	MsgIntraShardVoteResponse
 )
 
 // Message represents a consensus message
@@ -150,5 +152,28 @@ type FinalizedBlockMessage struct {
 	Proposal  Proposal
 	ShardID   ShardID
 	LeaderID  NodeID
+	Timestamp time.Time
+}
+
+// IntraShardVoteMessage for requesting votes within a shard
+type IntraShardVoteMessage struct {
+	Sequence  uint64
+	Proposal  Proposal
+	Phase     string // "preprep", "prepare", "commit"
+	ShardID   ShardID
+	NodeID    NodeID
+	Digest    string
+	Signature []byte
+	Timestamp time.Time
+}
+
+// IntraShardVoteResponse for responding to intra-shard vote requests
+type IntraShardVoteResponse struct {
+	Sequence  uint64
+	Phase     string
+	ShardID   ShardID
+	NodeID    NodeID
+	Vote      bool // true for approve, false for reject
+	Signature []byte
 	Timestamp time.Time
 }

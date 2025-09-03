@@ -209,6 +209,8 @@ type Config struct {
 	RequestInspector RequestInspector
 	// Application delivery interface
 	Application ApplicationDelivery
+	// Signer for signing proposals and messages
+	Signer Signer
 }
 
 // ConsensusInterface defines the main consensus operations
@@ -242,6 +244,12 @@ type Logger interface {
 // ApplicationDelivery interface for delivering finalized proposals to the application
 type ApplicationDelivery interface {
 	Deliver(proposal Proposal) error
+}
+
+// Signer interface for signing proposals and messages
+type Signer interface {
+	SignProposal(proposal Proposal, data []byte) *Signature
+	Sign(msg []byte) []byte
 }
 
 // Status represents the current status of the consensus
@@ -329,4 +337,10 @@ type CommitPhaseMessage struct {
 type RequestInfo struct {
 	ClientID string
 	ID       string
+}
+
+type Signature struct {
+	ID    uint64
+	Value []byte
+	Msg   []byte
 }

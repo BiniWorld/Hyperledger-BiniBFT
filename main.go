@@ -26,9 +26,9 @@ func main() {
 	shardMap := make(map[consensus.ShardID]Shard)
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		AddSource: false,
-		Level:     slog.LevelDebug,
+		Level:     slog.LevelInfo,
 	}))
-	numNodes := 5
+	numNodes := 50
 
 	networkOpts := NetworkOptions{
 		NumNodes:     numNodes,
@@ -36,7 +36,7 @@ func main() {
 		BatchTimeout: 2 * time.Second,
 	}
 
-	primary, shards := generateShardsWithRandomAssignment(numNodes, 2)
+	primary, shards := generateShardsWithRandomAssignment(numNodes, 7)
 	for i, shard := range shards {
 		shardID := consensus.ShardID(i + 1) // Assuming ShardID is int-based
 		shardMap[shardID] = shard

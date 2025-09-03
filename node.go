@@ -52,6 +52,14 @@ type Node struct {
 	storage           consensus.BlockStorage
 }
 
+type Metrix struct {
+	StartTime time.Time
+	EndTime   time.Time
+	Duriation time.Duration
+}
+
+var metrix map[string]*Metrix
+
 func NewNode(
 	id consensus.NodeID,
 	address string,
@@ -70,6 +78,7 @@ func NewNode(
 	clusterConfig clusterConfig, // Add cluster config parameter
 ) *Node {
 
+	metrix = map[string]*Metrix{}
 	logger.Info("Node initialized WAL")
 	walstorage, err := consensus.NewLevelDBStorage(nodeDir)
 	if err != nil {
@@ -136,6 +145,7 @@ func NewNode(
 	builder.WitAssembler(node)
 	builder.WithRequestInspector(node)
 	builder.WithApplication(node) // Use the node as the application delivery interface
+	builder.WithSigner(node)      // Use the node as the signer
 
 	// Configure ALL shards for cross-shard coordination using the cluster config
 	// This is needed so the primary leader knows about all shard leaders
@@ -268,6 +278,19 @@ func (n *Node) getOperationsServer() *http.Server {
 			isShardLeader = false
 		}
 
+		var avg time.Duration
+		var droppedTxns int
+		for k, v := range metrix {
+			if v.EndTime.IsZero() {
+				fmt.Printf("txn: %s is not in block\n", k)
+				droppedTxns++
+			}
+			v.Duriation = v.EndTime.Sub(v.StartTime)
+			avg += v.Duriation
+		}
+		count := len(metrix) - droppedTxns
+		avg = time.Duration(float64(avg) / float64(count))
+
 		ctx.JSON(200, gin.H{
 			"nodeID":        ownID,
 			"height":        height,
@@ -278,6 +301,8 @@ func (n *Node) getOperationsServer() *http.Server {
 			"isActive":      consensusStatus.IsActive,
 			"currentView":   consensusStatus.CurrentView,
 			"isPrimary":     consensusStatus.IsPrimary,
+			"avgDuriation":  avg.String(),
+			"dropped":       droppedTxns,
 		})
 	})
 
@@ -312,7 +337,7 @@ func (n *Node) getOperationsServer() *http.Server {
 			TS:       int(time.Now().UnixNano() / 1000000),
 			ID:       txID,
 		}
-
+		metrix[txID] = &Metrix{StartTime: time.Now()}
 		err = n.consensus.SubmitRequest(tx.ToBytes())
 		if err != nil {
 			c.JSON(500, gin.H{

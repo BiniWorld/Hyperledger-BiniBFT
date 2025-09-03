@@ -48,6 +48,9 @@ type View struct {
 	// Finalization tracking
 	finalizedSequences map[uint64]bool
 
+	// Intra-shard vote tracking - sequence -> phase -> nodeID -> vote
+	intraShardVotes map[uint64]map[string]map[NodeID]bool
+
 	// Timers
 	viewTimer *time.Timer
 
@@ -99,6 +102,7 @@ func NewView(primary NodeID, shardID ShardID, config *Config) *View {
 		shardAcks:          make(map[uint64]map[NodeID]*ShardAckMessage),
 		inFlightRequests:   make(map[uint64]*RequestInfo),
 		finalizedSequences: make(map[uint64]bool),
+		intraShardVotes:    make(map[uint64]map[string]map[NodeID]bool),
 		config:             config,
 		logger:             config.Logger,
 	}
@@ -133,6 +137,9 @@ func (v *View) Propose(proposal Proposal) error {
 			"finalizedCount", len(v.finalizedSequences))
 		return nil
 	}
+
+	// Clean up old sequences before proposing
+	v.cleanupOldSequences()
 
 	// Only primary leader can start pre-prepare
 	if v.config.Role != RolePrimaryLeader {
@@ -225,12 +232,25 @@ func (v *View) HandlePrePrepare(msg *PrePrepMessage) error {
 		return nil
 	}
 
-	// Check if this sequence is too old (behind current sequence)
-	if msg.Sequence < v.Sequence {
-		v.logger.Debug("Received pre-prep for old sequence, ignoring",
+	// Handle sequence synchronization
+	if !v.isValidSequenceRange(msg.Sequence) {
+		v.logger.Debug("Received pre-prep for sequence outside valid range, ignoring",
 			"receivedSequence", msg.Sequence,
 			"currentSequence", v.Sequence)
 		return nil
+	}
+
+	// If we receive a message for a future sequence, advance our sequence to catch up
+	if msg.Sequence > v.Sequence {
+		v.logger.Info("Received pre-prep for future sequence, advancing to catch up",
+			"receivedSequence", msg.Sequence,
+			"currentSequence", v.Sequence,
+			"nodeID", v.config.NodeID)
+		v.Sequence = msg.Sequence
+		// Update metadata if available
+		if v.config.Metadata != nil {
+			v.config.Metadata.LatestSequence = v.Sequence
+		}
 	}
 
 	v.logger.Info("Handling pre-prep message",
@@ -344,33 +364,10 @@ func (v *View) sendPrePrepAckToPrimary(sequence uint64) {
 		"fromShardLeader", v.config.NodeID)
 }
 
-// sendAckToShardLeader sends ACK from follower to shard leader
+// sendAckToShardLeader sends ACK from follower to shard leader after getting intra-shard consensus
 func (v *View) sendAckToShardLeader(prePrepMsg *PrePrepMessage) {
-	shardLeader := v.config.ShardLeaders[v.config.ShardID]
-
-	ack := &ShardAckMessage{
-		Sequence:     prePrepMsg.Sequence,
-		ShardID:      v.config.ShardID,
-		NodeID:       v.config.NodeID,
-		Acknowledged: true,
-		Phase:        "preprep",
-		Timestamp:    time.Now(),
-	}
-
-	msg := Message{
-		Type:      MsgShardAck,
-		From:      v.config.NodeID,
-		To:        shardLeader,
-		ShardID:   v.config.ShardID,
-		Timestamp: time.Now(),
-		Payload:   ack,
-	}
-
-	v.config.Network.Send(shardLeader, msg)
-	v.logger.Info("Sent pre-prep ACK to shard leader",
-		"sequence", prePrepMsg.Sequence,
-		"shardLeader", shardLeader,
-		"fromFollower", v.config.NodeID)
+	// First, broadcast to other nodes in the same shard to get consensus
+	v.broadcastToShardNodes(prePrepMsg, "preprep")
 }
 
 // HandleShardAck processes shard acknowledgment messages
@@ -387,14 +384,28 @@ func (v *View) HandleShardAck(ack *ShardAckMessage) error {
 		return nil
 	}
 
-	// Check if this sequence is too old (behind current sequence)
-	if ack.Sequence < v.Sequence {
-		v.logger.Debug("Received shard ACK for old sequence, ignoring",
+	// Handle sequence synchronization
+	if !v.isValidSequenceRange(ack.Sequence) {
+		v.logger.Debug("Received shard ACK for sequence outside valid range, ignoring",
 			"receivedSequence", ack.Sequence,
 			"currentSequence", v.Sequence,
 			"phase", ack.Phase,
 			"from", ack.NodeID)
 		return nil
+	}
+
+	// If we receive a message for a future sequence, advance our sequence to catch up
+	if ack.Sequence > v.Sequence {
+		v.logger.Info("Received shard ACK for future sequence, advancing to catch up",
+			"receivedSequence", ack.Sequence,
+			"currentSequence", v.Sequence,
+			"nodeID", v.config.NodeID,
+			"phase", ack.Phase)
+		v.Sequence = ack.Sequence
+		// Update metadata if available
+		if v.config.Metadata != nil {
+			v.config.Metadata.LatestSequence = v.Sequence
+		}
 	}
 
 	v.logger.Info("Handling shard ACK",
@@ -441,12 +452,25 @@ func (v *View) HandlePreparePhase(msg *PreparePhaseMessage) error {
 		return nil
 	}
 
-	// Check if this sequence is too old (behind current sequence)
-	if msg.Sequence < v.Sequence {
-		v.logger.Debug("Received prepare phase for old sequence, ignoring",
+	// Handle sequence synchronization
+	if !v.isValidSequenceRange(msg.Sequence) {
+		v.logger.Debug("Received prepare phase for sequence outside valid range, ignoring",
 			"receivedSequence", msg.Sequence,
 			"currentSequence", v.Sequence)
 		return nil
+	}
+
+	// If we receive a message for a future sequence, advance our sequence to catch up
+	if msg.Sequence > v.Sequence {
+		v.logger.Info("Received prepare phase for future sequence, advancing to catch up",
+			"receivedSequence", msg.Sequence,
+			"currentSequence", v.Sequence,
+			"nodeID", v.config.NodeID)
+		v.Sequence = msg.Sequence
+		// Update metadata if available
+		if v.config.Metadata != nil {
+			v.config.Metadata.LatestSequence = v.Sequence
+		}
 	}
 
 	v.logger.Info("Handling prepare phase message",
@@ -521,12 +545,25 @@ func (v *View) HandleCommitRequest(msg *CommitRequestMessage) error {
 		return nil
 	}
 
-	// Check if this sequence is too old (behind current sequence)
-	if msg.Sequence < v.Sequence {
-		v.logger.Debug("Received commit request for old sequence, ignoring",
+	// Handle sequence synchronization
+	if !v.isValidSequenceRange(msg.Sequence) {
+		v.logger.Debug("Received commit request for sequence outside valid range, ignoring",
 			"receivedSequence", msg.Sequence,
 			"currentSequence", v.Sequence)
 		return nil
+	}
+
+	// If we receive a message for a future sequence, advance our sequence to catch up
+	if msg.Sequence > v.Sequence {
+		v.logger.Info("Received commit request for future sequence, advancing to catch up",
+			"receivedSequence", msg.Sequence,
+			"currentSequence", v.Sequence,
+			"nodeID", v.config.NodeID)
+		v.Sequence = msg.Sequence
+		// Update metadata if available
+		if v.config.Metadata != nil {
+			v.config.Metadata.LatestSequence = v.Sequence
+		}
 	}
 
 	v.logger.Info("Handling commit request message",
@@ -574,7 +611,7 @@ func (v *View) HandleCommitRequest(msg *CommitRequestMessage) error {
 			NodeID:    v.config.NodeID,
 			ShardID:   v.config.ShardID,
 			Approve:   true,
-			Signature: v.signMessage(msg.Proposal.Payload),
+			Signature: v.signProposalForCommit(msg.Proposal),
 		}
 		if v.captureVoteForSequence(msg.Sequence, ownVote, "commit") {
 			v.logger.Info("Commit phase quorum reached via SmartBFT (with own vote)", "sequence", msg.Sequence)
@@ -652,6 +689,226 @@ func (v *View) signMessage(data []byte) []byte {
 	return []byte(fmt.Sprintf("sig-%s", string(data)))
 }
 
+// signProposalForCommit uses the proper signer for commit phase
+func (v *View) signProposalForCommit(proposal Proposal) []byte {
+	if v.config.Signer != nil {
+		signature := v.config.Signer.SignProposal(proposal, proposal.Payload)
+		if signature != nil {
+			return signature.Value
+		}
+	}
+	// Fallback to simple signature
+	return v.signMessage(proposal.Payload)
+}
+
+// broadcastToShardNodes broadcasts a message to other nodes in the same shard for intra-shard consensus
+func (v *View) broadcastToShardNodes(payload interface{}, phase string) {
+	shardNodes := v.config.ShardNodes[v.config.ShardID]
+
+	var sequence uint64
+	var proposal Proposal
+	var digest string
+	var signature []byte
+
+	// Extract common fields based on message type
+	switch msg := payload.(type) {
+	case *PrePrepMessage:
+		sequence = msg.Sequence
+		proposal = msg.Proposal
+		digest = msg.Digest
+		signature = msg.Signature
+	case *PreparePhaseMessage:
+		sequence = msg.Sequence
+		proposal = msg.Proposal
+		digest = msg.Digest
+		signature = msg.Signature
+	case *CommitRequestMessage:
+		sequence = msg.Sequence
+		proposal = msg.Proposal
+		digest = msg.Digest
+		signature = msg.Signature
+	default:
+		v.logger.Error("Unknown message type for intra-shard broadcast")
+		return
+	}
+
+	voteMsg := &IntraShardVoteMessage{
+		Sequence:  sequence,
+		Proposal:  proposal,
+		Phase:     phase,
+		ShardID:   v.config.ShardID,
+		NodeID:    v.config.NodeID,
+		Digest:    digest,
+		Signature: signature,
+		Timestamp: time.Now(),
+	}
+
+	// Send to all other nodes in the same shard
+	for _, nodeID := range shardNodes {
+		if nodeID != v.config.NodeID { // Don't send to self
+			msg := Message{
+				Type:      MsgIntraShardVote,
+				From:      v.config.NodeID,
+				To:        nodeID,
+				ShardID:   v.config.ShardID,
+				Timestamp: time.Now(),
+				Payload:   voteMsg,
+			}
+			v.config.Network.Send(nodeID, msg)
+		}
+	}
+
+	v.logger.Info("Broadcasted intra-shard vote request",
+		"sequence", sequence,
+		"phase", phase,
+		"shardNodes", len(shardNodes)-1) // -1 because we don't send to self
+
+	// Add our own vote
+	v.recordIntraShardVote(sequence, phase, v.config.NodeID, true)
+
+	// Check if we already have majority (in case there are only 2 nodes in shard)
+	v.checkIntraShardMajority(sequence, phase)
+}
+
+// HandleIntraShardVote processes intra-shard vote requests
+func (v *View) HandleIntraShardVote(voteMsg *IntraShardVoteMessage) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.logger.Info("Handling intra-shard vote request",
+		"sequence", voteMsg.Sequence,
+		"phase", voteMsg.Phase,
+		"from", voteMsg.NodeID)
+
+	// Validate the vote request (basic validation)
+	// In production, you'd verify signatures, check proposal validity, etc.
+	vote := true // For now, always vote yes
+
+	// Send vote response back
+	response := &IntraShardVoteResponse{
+		Sequence:  voteMsg.Sequence,
+		Phase:     voteMsg.Phase,
+		ShardID:   v.config.ShardID,
+		NodeID:    v.config.NodeID,
+		Vote:      vote,
+		Signature: v.signMessage([]byte(fmt.Sprintf("%d-%s-%t", voteMsg.Sequence, voteMsg.Phase, vote))),
+		Timestamp: time.Now(),
+	}
+
+	msg := Message{
+		Type:      MsgIntraShardVoteResponse,
+		From:      v.config.NodeID,
+		To:        voteMsg.NodeID,
+		ShardID:   v.config.ShardID,
+		Timestamp: time.Now(),
+		Payload:   response,
+	}
+
+	v.config.Network.Send(voteMsg.NodeID, msg)
+	v.logger.Info("Sent intra-shard vote response",
+		"sequence", voteMsg.Sequence,
+		"phase", voteMsg.Phase,
+		"vote", vote,
+		"to", voteMsg.NodeID)
+
+	return nil
+}
+
+// HandleIntraShardVoteResponse processes intra-shard vote responses
+func (v *View) HandleIntraShardVoteResponse(response *IntraShardVoteResponse) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.logger.Info("Handling intra-shard vote response",
+		"sequence", response.Sequence,
+		"phase", response.Phase,
+		"from", response.NodeID,
+		"vote", response.Vote)
+
+	// Record the vote
+	v.recordIntraShardVote(response.Sequence, response.Phase, response.NodeID, response.Vote)
+
+	// Check if we have majority
+	v.checkIntraShardMajority(response.Sequence, response.Phase)
+
+	return nil
+}
+
+// recordIntraShardVote records a vote from a shard node
+func (v *View) recordIntraShardVote(sequence uint64, phase string, nodeID NodeID, vote bool) {
+	if _, exists := v.intraShardVotes[sequence]; !exists {
+		v.intraShardVotes[sequence] = make(map[string]map[NodeID]bool)
+	}
+	if _, exists := v.intraShardVotes[sequence][phase]; !exists {
+		v.intraShardVotes[sequence][phase] = make(map[NodeID]bool)
+	}
+	v.intraShardVotes[sequence][phase][nodeID] = vote
+}
+
+// checkIntraShardMajority checks if we have majority votes and sends ACK to shard leader
+func (v *View) checkIntraShardMajority(sequence uint64, phase string) {
+	shardNodes := v.config.ShardNodes[v.config.ShardID]
+	requiredCount := (len(shardNodes) / 2) + 1 // Simple majority
+
+	votes, exists := v.intraShardVotes[sequence][phase]
+	if !exists {
+		return
+	}
+
+	approveCount := 0
+	totalVotes := 0
+	for _, vote := range votes {
+		totalVotes++
+		if vote {
+			approveCount++
+		}
+	}
+
+	v.logger.Info("Checking intra-shard majority",
+		"sequence", sequence,
+		"phase", phase,
+		"approveCount", approveCount,
+		"totalVotes", totalVotes,
+		"required", requiredCount)
+
+	if approveCount >= requiredCount {
+		v.logger.Info("Intra-shard majority reached - sending ACK to shard leader",
+			"sequence", sequence,
+			"phase", phase)
+		v.sendAckToShardLeaderAfterConsensus(sequence, phase)
+	}
+}
+
+// sendAckToShardLeaderAfterConsensus sends ACK to shard leader after achieving intra-shard consensus
+func (v *View) sendAckToShardLeaderAfterConsensus(sequence uint64, phase string) {
+	shardLeader := v.config.ShardLeaders[v.config.ShardID]
+
+	ack := &ShardAckMessage{
+		Sequence:     sequence,
+		ShardID:      v.config.ShardID,
+		NodeID:       v.config.NodeID,
+		Acknowledged: true,
+		Phase:        phase,
+		Timestamp:    time.Now(),
+	}
+
+	msg := Message{
+		Type:      MsgShardAck,
+		From:      v.config.NodeID,
+		To:        shardLeader,
+		ShardID:   v.config.ShardID,
+		Timestamp: time.Now(),
+		Payload:   ack,
+	}
+
+	v.config.Network.Send(shardLeader, msg)
+	v.logger.Info("Sent ACK to shard leader after intra-shard consensus",
+		"sequence", sequence,
+		"phase", phase,
+		"shardLeader", shardLeader,
+		"fromFollower", v.config.NodeID)
+}
+
 // GetPhase returns the current consensus phase
 func (v *View) GetPhase() ViewPhase {
 	v.mu.RLock()
@@ -666,6 +923,23 @@ func (v *View) GetViewNumber() uint64 {
 	return v.Number
 }
 
+// isValidSequenceRange checks if a sequence is within the valid range (current or previous)
+func (v *View) isValidSequenceRange(sequence uint64) bool {
+	// Allow current sequence and previous sequence only
+	if sequence == v.Sequence {
+		return true
+	}
+	if v.Sequence > 0 && sequence == v.Sequence-1 {
+		return true
+	}
+	// Also allow next sequence to handle synchronization issues where
+	// primary leader advances faster than other nodes
+	if sequence == v.Sequence+1 {
+		return true
+	}
+	return false
+}
+
 // IsProposalInProgress checks if there's already a proposal in progress for the current sequence
 func (v *View) IsProposalInProgress() bool {
 	v.mu.RLock()
@@ -677,8 +951,12 @@ func (v *View) IsProposalInProgress() bool {
 	}
 
 	// Check if there's already a proposal in progress for this sequence
-	_, exists := v.prePrepMessages[v.Sequence]
-	return exists
+	// Only consider it in progress if we have pre-prep messages for current sequence
+	if prePrepMsgs, exists := v.prePrepMessages[v.Sequence]; exists && len(prePrepMsgs) > 0 {
+		return true
+	}
+
+	return false
 }
 
 // Reset resets the view state for a new consensus round
@@ -694,6 +972,7 @@ func (v *View) Reset() {
 	v.shardAcks = make(map[uint64]map[NodeID]*ShardAckMessage)
 	v.inFlightRequests = make(map[uint64]*RequestInfo)
 	v.finalizedSequences = make(map[uint64]bool)
+	v.intraShardVotes = make(map[uint64]map[string]map[NodeID]bool)
 
 	if v.viewTimer != nil {
 		v.viewTimer.Stop()
@@ -714,132 +993,37 @@ func (v *View) forwardPrepareToFollowers(prepareMsg *PreparePhaseMessage) {
 				Payload:   prepareMsg,
 			}
 			v.config.Network.Send(nodeID, msg)
-			v.logger.Info("📤 Forwarded prepare phase to follower",
+			v.logger.Info("Forwarded prepare phase to follower",
 				"sequence", prepareMsg.Sequence,
 				"follower", nodeID)
 		}
 	}
 }
 
-// sendPrepareAckToShardLeader sends prepare ACK from follower to shard leader
+// sendPrepareAckToShardLeader sends prepare ACK from follower to shard leader after getting intra-shard consensus
 func (v *View) sendPrepareAckToShardLeader(sequence uint64) {
-	shardLeader := v.config.ShardLeaders[v.config.ShardID]
-
-	ack := &ShardAckMessage{
-		Sequence:     sequence,
-		ShardID:      v.config.ShardID,
-		NodeID:       v.config.NodeID,
-		Acknowledged: true,
-		Phase:        "prepare",
-		Timestamp:    time.Now(),
+	// Get the proposal from prepare messages for broadcasting
+	var proposal Proposal
+	if prepareMsgs, exists := v.prepareMessages[sequence]; exists {
+		for _, msg := range prepareMsgs {
+			proposal = msg.Proposal
+			break
+		}
 	}
 
-	msg := Message{
-		Type:      MsgShardAck,
-		From:      v.config.NodeID,
-		To:        shardLeader,
+	// Create a prepare message for intra-shard consensus
+	prepareMsg := &PreparePhaseMessage{
+		Proposal:  proposal,
+		View:      v.Number,
+		Sequence:  sequence,
+		Digest:    proposal.Digest(),
+		NodeID:    v.config.NodeID,
 		ShardID:   v.config.ShardID,
-		Timestamp: time.Now(),
-		Payload:   ack,
+		Signature: v.signMessage(proposal.Payload),
 	}
 
-	v.config.Network.Send(shardLeader, msg)
-	v.logger.Info("📤 Sent prepare ACK to shard leader",
-		"sequence", sequence,
-		"shardLeader", shardLeader,
-		"fromFollower", v.config.NodeID)
-}
-
-// checkFollowerPrepareMajority checks if majority of followers have sent prepare ACKs
-func (v *View) checkFollowerPrepareMajority(sequence uint64) {
-	shardNodes := v.config.ShardNodes[v.config.ShardID]
-	requiredCount := int(float64(len(shardNodes)) * v.config.ShardMajorityThreshold)
-	if requiredCount < 1 {
-		requiredCount = 1
-	}
-
-	// Count prepare ACKs from followers in this shard (including self)
-	ackCount := 1 // Count self as ACK
-	if acks, exists := v.shardAcks[sequence]; exists {
-		for _, ack := range acks {
-			if ack.ShardID == v.config.ShardID && ack.Acknowledged && ack.Phase == "prepare" {
-				ackCount++
-			}
-		}
-	}
-
-	v.logger.Info("Checking follower prepare majority",
-		"sequence", sequence,
-		"ackCount", ackCount,
-		"required", requiredCount)
-
-	if ackCount >= requiredCount {
-		v.logger.Info("Follower prepare majority reached - sending prepare ACK to primary", "sequence", sequence)
-		v.sendPrepareAckToPrimary(sequence)
-	}
-}
-
-// sendPrepareAckToPrimary sends prepare acknowledgment from shard leader to primary
-func (v *View) sendPrepareAckToPrimary(sequence uint64) {
-	ack := &ShardAckMessage{
-		Sequence:     sequence,
-		ShardID:      v.config.ShardID,
-		NodeID:       v.config.NodeID,
-		Acknowledged: true,
-		Phase:        "prepare",
-		Timestamp:    time.Now(),
-	}
-
-	msg := Message{
-		Type:      MsgShardAck,
-		From:      v.config.NodeID,
-		To:        v.config.PrimaryLeader,
-		ShardID:   v.config.ShardID,
-		Timestamp: time.Now(),
-		Payload:   ack,
-	}
-
-	v.config.Network.Send(v.config.PrimaryLeader, msg)
-	v.logger.Info("📤 Sent prepare ACK to primary leader", "sequence", sequence)
-}
-
-// checkPrimaryPrepareQuorum checks if majority of shard leaders have prepared
-func (v *View) checkPrimaryPrepareQuorum(sequence uint64) {
-	// Count prepare ACKs from shard leaders
-	prepareAckCount := 0
-	if acks, exists := v.shardAcks[sequence]; exists {
-		for _, ack := range acks {
-			if ack.Phase == "prepare" && ack.Acknowledged {
-				prepareAckCount++
-			}
-		}
-	}
-
-	// totalShardLeaders := len(v.config.ShardLeaders)
-	// Count only other shard leaders (excluding primary leader itself)
-	otherShardLeaders := 0
-	for _, shardLeader := range v.config.ShardLeaders {
-		if shardLeader != v.config.NodeID {
-			otherShardLeaders++
-		}
-	}
-
-	requiredCount := int(float64(otherShardLeaders) * v.config.CrossShardThreshold)
-	if requiredCount < 1 && otherShardLeaders > 0 {
-		requiredCount = 1
-	}
-
-	v.logger.Info("Checking primary prepare quorum",
-		"sequence", sequence,
-		"prepareAckCount", prepareAckCount,
-		"requiredCount", requiredCount,
-		"otherShardLeaders", otherShardLeaders)
-
-	// If there are no other shard leaders, or we have enough ACKs, proceed to commit
-	if otherShardLeaders == 0 || prepareAckCount >= requiredCount {
-		v.logger.Info("Primary prepare quorum reached", "sequence", sequence)
-		v.startCommitPhaseWithShardLeaders(sequence)
-	}
+	// Broadcast to other nodes in the same shard to get consensus
+	v.broadcastToShardNodes(prepareMsg, "prepare")
 }
 
 // startCommitPhaseWithShardLeaders starts commit phase by sending to shard leaders
@@ -865,7 +1049,7 @@ func (v *View) startCommitPhaseWithShardLeaders(sequence uint64) {
 		Digest:    proposal.Digest(),
 		NodeID:    v.config.NodeID,
 		ShardID:   v.config.ShardID,
-		Signature: v.signMessage(proposal.Payload),
+		Signature: v.signProposalForCommit(proposal),
 	}
 
 	// Send to all other shard leaders
@@ -922,33 +1106,30 @@ func (v *View) forwardCommitToFollowers(commitMsg *CommitRequestMessage) {
 	}
 }
 
-// sendCommitAckToShardLeader sends commit ACK from follower to shard leader
+// sendCommitAckToShardLeader sends commit ACK from follower to shard leader after getting intra-shard consensus
 func (v *View) sendCommitAckToShardLeader(sequence uint64) {
-	shardLeader := v.config.ShardLeaders[v.config.ShardID]
-
-	ack := &ShardAckMessage{
-		Sequence:     sequence,
-		ShardID:      v.config.ShardID,
-		NodeID:       v.config.NodeID,
-		Acknowledged: true,
-		Phase:        "commit",
-		Timestamp:    time.Now(),
+	// Get the proposal from commit messages for broadcasting
+	var proposal Proposal
+	if commitMsgs, exists := v.commitMessages[sequence]; exists {
+		for _, msg := range commitMsgs {
+			proposal = msg.Proposal
+			break
+		}
 	}
 
-	msg := Message{
-		Type:      MsgShardAck,
-		From:      v.config.NodeID,
-		To:        shardLeader,
+	// Create a commit message for intra-shard consensus
+	commitMsg := &CommitRequestMessage{
+		Proposal:  proposal,
+		View:      v.Number,
+		Sequence:  sequence,
+		Digest:    proposal.Digest(),
+		NodeID:    v.config.NodeID,
 		ShardID:   v.config.ShardID,
-		Timestamp: time.Now(),
-		Payload:   ack,
+		Signature: v.signProposalForCommit(proposal),
 	}
 
-	v.config.Network.Send(shardLeader, msg)
-	v.logger.Info("Sent commit ACK to shard leader",
-		"sequence", sequence,
-		"shardLeader", shardLeader,
-		"fromFollower", v.config.NodeID)
+	// Broadcast to other nodes in the same shard to get consensus
+	v.broadcastToShardNodes(commitMsg, "commit")
 }
 
 // sendCommitAckToPrimary sends commit acknowledgment from shard leader to primary leader
@@ -972,39 +1153,10 @@ func (v *View) sendCommitAckToPrimary(sequence uint64) {
 	}
 
 	v.config.Network.Send(v.config.PrimaryLeader, msg)
-	v.logger.Info("📤 Sent commit ACK to primary leader",
+	v.logger.Info("Sent commit ACK to primary leader",
 		"sequence", sequence,
 		"primaryLeader", v.config.PrimaryLeader,
 		"fromShardLeader", v.config.NodeID)
-}
-
-// checkFollowerCommitMajority checks if majority of followers have sent commit ACKs
-func (v *View) checkFollowerCommitMajority(sequence uint64) {
-	shardNodes := v.config.ShardNodes[v.config.ShardID]
-	requiredCount := int(float64(len(shardNodes)) * v.config.ShardMajorityThreshold)
-	if requiredCount < 1 {
-		requiredCount = 1
-	}
-
-	// Count commit ACKs from followers in this shard (including self)
-	ackCount := 1 // Count self as ACK
-	if acks, exists := v.shardAcks[sequence]; exists {
-		for _, ack := range acks {
-			if ack.ShardID == v.config.ShardID && ack.Acknowledged && ack.Phase == "commit" {
-				ackCount++
-			}
-		}
-	}
-
-	v.logger.Info("Checking follower commit majority",
-		"sequence", sequence,
-		"ackCount", ackCount,
-		"required", requiredCount)
-
-	if ackCount >= requiredCount {
-		v.logger.Info("Follower commit majority reached - sending commit ACK to primary", "sequence", sequence)
-		v.sendCommitAckToPrimary(sequence)
-	}
 }
 
 // checkPrimaryCommitQuorum checks if majority of shard leaders have committed
@@ -1041,7 +1193,7 @@ func (v *View) checkPrimaryCommitQuorum(sequence uint64) {
 
 	// If there are no other shard leaders, or we have enough ACKs, finalize
 	if otherShardLeaders == 0 || commitAckCount >= requiredCount {
-		v.logger.Info("✅ Primary commit quorum reached - consensus complete", "sequence", sequence)
+		v.logger.Info("Primary commit quorum reached - consensus complete", "sequence", sequence)
 		// Get the proposal from pre-prepare messages (primary leader has these)
 		var proposal Proposal
 		if prePrepMsgs, exists := v.prePrepMessages[sequence]; exists {
@@ -1119,6 +1271,66 @@ func (v *View) cleanupSequenceTrackingData(sequence uint64) {
 	delete(v.commitMessages, sequence)
 	delete(v.shardAcks, sequence)
 	delete(v.inFlightRequests, sequence)
+
+	// Also clean up any sequences that are now too old (more than 1 behind current)
+	v.cleanupOldSequences()
+}
+
+// cleanupOldSequences removes data for sequences that are outside the valid range
+func (v *View) cleanupOldSequences() {
+	minValidSequence := uint64(0)
+	if v.Sequence > 1 {
+		minValidSequence = v.Sequence - 1
+	}
+
+	// Clean up old pre-prep messages
+	for seq := range v.prePrepMessages {
+		if seq < minValidSequence {
+			delete(v.prePrepMessages, seq)
+		}
+	}
+
+	// Clean up old prepare messages
+	for seq := range v.prepareMessages {
+		if seq < minValidSequence {
+			delete(v.prepareMessages, seq)
+		}
+	}
+
+	// Clean up old commit messages
+	for seq := range v.commitMessages {
+		if seq < minValidSequence {
+			delete(v.commitMessages, seq)
+		}
+	}
+
+	// Clean up old shard acks
+	for seq := range v.shardAcks {
+		if seq < minValidSequence {
+			delete(v.shardAcks, seq)
+		}
+	}
+
+	// Clean up old in-flight requests
+	for seq := range v.inFlightRequests {
+		if seq < minValidSequence {
+			delete(v.inFlightRequests, seq)
+		}
+	}
+
+	// Clean up old sequence votes
+	for seq := range v.sequenceVotes {
+		if seq < minValidSequence {
+			delete(v.sequenceVotes, seq)
+		}
+	}
+
+	// Clean up old finalized sequences (keep only recent ones)
+	for seq := range v.finalizedSequences {
+		if seq < minValidSequence {
+			delete(v.finalizedSequences, seq)
+		}
+	}
 }
 
 // captureVoteForSequence captures votes for SmartBFT-style sequence-based consensus
@@ -1132,14 +1344,29 @@ func (v *View) captureVoteForSequence(sequence uint64, vote *Vote, phase string)
 		return false
 	}
 
-	// Check if this sequence is too old (behind current sequence)
-	if sequence < v.Sequence {
-		v.logger.Debug("Received vote for old sequence, ignoring",
+	// Handle sequence synchronization
+	if !v.isValidSequenceRange(sequence) {
+		v.logger.Debug("Received vote for sequence outside valid range, ignoring",
 			"receivedSequence", sequence,
 			"currentSequence", v.Sequence,
 			"phase", phase,
 			"voter", vote.NodeID)
 		return false
+	}
+
+	// If we receive a vote for a future sequence, advance our sequence to catch up
+	if sequence > v.Sequence {
+		v.logger.Info("Received vote for future sequence, advancing to catch up",
+			"receivedSequence", sequence,
+			"currentSequence", v.Sequence,
+			"nodeID", v.config.NodeID,
+			"phase", phase,
+			"voter", vote.NodeID)
+		v.Sequence = sequence
+		// Update metadata if available
+		if v.config.Metadata != nil {
+			v.config.Metadata.LatestSequence = v.Sequence
+		}
 	}
 
 	// Initialize tracker if not exists
@@ -1297,7 +1524,7 @@ func (v *View) forwardFinalizedBlockToFollowers(sequence uint64, proposal Propos
 			}
 
 			v.config.Network.Send(nodeID, msg)
-			v.logger.Info("📤 Forwarded finalized block to follower",
+			v.logger.Info("Forwarded finalized block to follower",
 				"sequence", sequence,
 				"follower", nodeID,
 				"shardID", v.config.ShardID)
@@ -1307,18 +1534,6 @@ func (v *View) forwardFinalizedBlockToFollowers(sequence uint64, proposal Propos
 
 // cleanupSequenceTracking cleans up vote tracking for a completed sequence
 func (v *View) cleanupSequenceTracking(sequence uint64) {
-	delete(v.sequenceVotes, sequence)
-
-	// Also clean up old finalized sequences to prevent memory leak
-	// Keep only recent finalized sequences (last 100)
-	if len(v.finalizedSequences) > 100 {
-		minSequence := v.Sequence - 50
-		for seq := range v.finalizedSequences {
-			if seq < minSequence {
-				delete(v.finalizedSequences, seq)
-			}
-		}
-	}
 	delete(v.sequenceVotes, sequence)
 	v.logger.Debug("Cleaned up SmartBFT sequence vote tracker",
 		"view", v.Number,
@@ -1377,13 +1592,16 @@ func (v *View) finalizeProposalAndCreateBlock(sequence uint64, proposal Proposal
 			v.config.Metadata.DecisionsInView = v.DecisionsInView
 		}
 
+		// Clean up old sequences now that we've advanced
+		v.cleanupOldSequences()
+
 		v.logger.Info("Sequence advanced after successful consensus",
 			"view", v.Number,
 			"newSequence", v.Sequence,
 			"finalizedSequence", sequence,
 			"decisionsInView", v.DecisionsInView)
 	} else {
-		v.logger.Info("⚠️ Finalized out-of-order sequence, not advancing current sequence",
+		v.logger.Info("Finalized out-of-order sequence, not advancing current sequence",
 			"finalizedSequence", sequence,
 			"currentSequence", v.Sequence)
 	}

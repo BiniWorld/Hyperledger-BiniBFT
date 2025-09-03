@@ -153,7 +153,7 @@ func (hc *Consensus) GetCurrentView() *View {
 // processBatchFromManager processes batches from the batch manager
 func (hc *Consensus) processBatch() {
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond) // Add a reasonable delay between batch checks
+		ticker := time.NewTicker(500 * time.Millisecond) // Add a reasonable delay between batch checks
 		defer ticker.Stop()
 
 		for {
@@ -174,7 +174,7 @@ func (c *Consensus) propose() {
 
 	// Check if there's already a proposal in progress for the current sequence
 	if c.currentViewObj.IsProposalInProgress() {
-		c.config.Logger.Debug("Proposal already in progress, skipping batch check",
+		c.config.Logger.Debug("Proposal already in progress, will retry later",
 			"sequence", c.currentViewObj.Sequence)
 		return
 	}
@@ -363,6 +363,34 @@ func (hc *Consensus) HandleMessage(from NodeID, message Message) error {
 				hc.handleFinalizedBlock(&finalizedBlockMsg)
 			} else {
 				hc.config.Logger.Error("Failed to unmarshal finalized block payload", "error", err)
+			}
+		}
+	case MsgIntraShardVote:
+		var intraShardVoteMsg IntraShardVoteMessage
+		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
+			if err := json.Unmarshal(payloadBytes, &intraShardVoteMsg); err == nil {
+				hc.config.Logger.Debug("Received intra-shard vote message", "sequence", intraShardVoteMsg.Sequence, "phase", intraShardVoteMsg.Phase, "from", message.From)
+				if hc.currentViewObj != nil {
+					if err := hc.currentViewObj.HandleIntraShardVote(&intraShardVoteMsg); err != nil {
+						hc.config.Logger.Error("Failed to handle intra-shard vote in view", "error", err)
+					}
+				}
+			} else {
+				hc.config.Logger.Error("Failed to unmarshal intra-shard vote payload", "error", err)
+			}
+		}
+	case MsgIntraShardVoteResponse:
+		var intraShardVoteResponse IntraShardVoteResponse
+		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
+			if err := json.Unmarshal(payloadBytes, &intraShardVoteResponse); err == nil {
+				hc.config.Logger.Debug("Received intra-shard vote response", "sequence", intraShardVoteResponse.Sequence, "phase", intraShardVoteResponse.Phase, "from", message.From)
+				if hc.currentViewObj != nil {
+					if err := hc.currentViewObj.HandleIntraShardVoteResponse(&intraShardVoteResponse); err != nil {
+						hc.config.Logger.Error("Failed to handle intra-shard vote response in view", "error", err)
+					}
+				}
+			} else {
+				hc.config.Logger.Error("Failed to unmarshal intra-shard vote response payload", "error", err)
 			}
 		}
 	}

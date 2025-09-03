@@ -225,6 +225,16 @@ func (b *ConsensusBuilder) WithApplication(app ApplicationDelivery) *ConsensusBu
 	return b
 }
 
+func (b *ConsensusBuilder) WithSigner(signer Signer) *ConsensusBuilder {
+	if b.err != nil {
+		return b
+	}
+
+	b.config.Signer = signer
+
+	return b
+}
+
 // Build creates a new consensus instance
 func (b *ConsensusBuilder) Build() (*Consensus, error) {
 	if b.err != nil {

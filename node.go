@@ -45,11 +45,24 @@ type Node struct {
 	shardId           consensus.ShardID
 	followers         []consensus.NodeID
 	role              consensus.NodeRole
-	primaryId         consensus.NodeID
+	roleUpdateChan    chan consensus.NodeRole // Channel to receive role updates
 	logger            consensus.Logger
-	mapNodes          map[string]*NodeInfo
 	cachedHttpClients map[string]*http.Client
 	storage           consensus.BlockStorage
+	comm              *Communicator
+	primaryId         consensus.NodeID
+	shardLeaderId     consensus.NodeID
+	mapNodes          map[string]*NodeInfo
+
+	lastHeartbeat          time.Time      // Last received heartbeat from primary
+	heartbeatTicker        *time.Ticker   // For sending heartbeat (if primary)
+	heartbeatStop          chan struct{}  // Stop signal for heartbeat loop
+	heartbeatWG            sync.WaitGroup // WaitGroup for cleanup
+	lastHeartbeats         map[consensus.NodeID]time.Time
+	heartbeatMonitorTicker *time.Ticker
+	heartbeatMonitorWG     sync.WaitGroup
+	heartbeatSeen          map[consensus.NodeID]bool
+	heartbeatMutex         sync.RWMutex // Mutex for heartbeat maps
 }
 
 type Metrix struct {
@@ -76,6 +89,7 @@ func NewNode(
 	role consensus.NodeRole,
 	primaryId consensus.NodeID,
 	clusterConfig clusterConfig, // Add cluster config parameter
+
 ) *Node {
 
 	metrix = map[string]*Metrix{}
@@ -109,12 +123,20 @@ func NewNode(
 		deliverChan: deliverChan,
 		stopChan:    make(chan struct{}),
 		logger:      logger,
-		mapNodes:    mapNodes,
-		shardId:     shardId,
-		storage:     storage,
-		config:      clusterConfig,
-	}
 
+		shardId: shardId,
+		storage: storage,
+
+		config:         clusterConfig,
+		mapNodes:       mapNodes,
+		lastHeartbeats: make(map[consensus.NodeID]time.Time),
+		shardLeaderId:  shardLeaderId,
+		role:           role,
+		primaryId:      clusterConfig.primaryId,
+		heartbeatSeen:  make(map[consensus.NodeID]bool),
+		roleUpdateChan: make(chan consensus.NodeRole, 1),
+		comm:           comm,
+	}
 	metadata := &protos.ViewMetadata{
 		LatestSequence: 0,
 		ViewId:         0,
@@ -153,18 +175,182 @@ func NewNode(
 		builder.WithShard(shardID, shard.LeaderId, shard.Followers)
 		logger.Debug("Configured shard", "shardID", shardID, "leader", shard.LeaderId, "followers", shard.Followers)
 	}
-
 	node.consensus, err = builder.Build()
+
+	// Set node reference in consensus config for role updates
+	if node.consensus != nil {
+		node.consensus.SetNodeReference(node)
+	}
 	if err != nil {
 		panic("error building consensus")
 	}
+	node.lastHeartbeats[node.primaryId] = time.Time{}
+	node.lastHeartbeats[node.shardLeaderId] = time.Time{}
 
+	node.heartbeatSeen[node.primaryId] = false
+	node.heartbeatSeen[node.shardLeaderId] = false
 	node.consensus.Start(context.Background())
 
 	node.Start()
 
 	return node
 }
+
+// unmarshalConsensusMessage properly unmarshals a consensus message with correct payload types
+func (c *Node) unmarshalConsensusMessage(data []byte) (*consensus.Message, error) {
+	// First, unmarshal into a temporary struct to get the message type
+	var tempMsg struct {
+		Type      consensus.MessageType `json:"Type"`
+		From      consensus.NodeID      `json:"From"`
+		To        consensus.NodeID      `json:"To"`
+		ShardID   consensus.ShardID     `json:"ShardID"`
+		Timestamp time.Time             `json:"Timestamp"`
+		Payload   json.RawMessage       `json:"Payload"`
+	}
+
+	err := json.Unmarshal(data, &tempMsg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal message: %w", err)
+	}
+
+	// Create the final message
+	message := &consensus.Message{
+		Type:      tempMsg.Type,
+		From:      tempMsg.From,
+		To:        tempMsg.To,
+		ShardID:   tempMsg.ShardID,
+		Timestamp: tempMsg.Timestamp,
+	}
+
+	// Convert payload based on message type
+	switch tempMsg.Type {
+	case consensus.MsgLeaderElection:
+		var payload consensus.LeaderElectionMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal LeaderElectionMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgElectionAck:
+		var payload consensus.ElectionAckMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal ElectionAckMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgShardAssignment:
+		var payload consensus.ShardAssignmentMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal ShardAssignmentMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgLeaderAnnouncement:
+		var payload consensus.LeaderAnnouncementMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal LeaderAnnouncementMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgHeartbeat:
+		var payload consensus.HeartbeatMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal HeartbeatMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgRequest:
+		var payload consensus.RequestMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal RequestMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgPrePrep:
+		var payload consensus.PrePrepMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal PrePrepMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgPreparePhase:
+		var payload consensus.PreparePhaseMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal PreparePhaseMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgPrepare:
+		var payload consensus.PrepMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal PrepMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgCommitRequest:
+		var payload consensus.CommitRequestMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal CommitRequestMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgCommitPhase:
+		var payload consensus.CommitMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal CommitMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgViewChange:
+		var payload consensus.ViewChangeRequest
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal ViewChangeRequest: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgCrossShardRequest:
+		var payload consensus.CrossShardRequestMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal CrossShardRequestMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgShardAck:
+		var payload consensus.ShardAckMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal ShardAckMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgFinalizedBlock:
+		var payload consensus.FinalizedBlockMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal FinalizedBlockMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgIntraShardVote:
+		var payload consensus.IntraShardVoteMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal IntraShardVoteMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgIntraShardVoteResponse:
+		var payload consensus.IntraShardVoteResponse
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal IntraShardVoteResponse: %w", err)
+		}
+		message.Payload = &payload
+
+	default:
+		// For unknown message types, keep as raw JSON
+		message.Payload = tempMsg.Payload
+	}
+
+	return message, nil
+}
+
 func (c *Node) getCommServer() *http3.Server {
 	tlsCert, err := generateSelfSignedCert()
 	if err != nil {
@@ -203,9 +389,8 @@ func (c *Node) getCommServer() *http3.Server {
 			return
 		}
 
-		// Parse the consensus message
-		var message consensus.Message
-		err = json.Unmarshal(requestBody, &message)
+		// Parse the consensus message with proper payload type conversion
+		message, err := c.unmarshalConsensusMessage(requestBody)
 		if err != nil {
 			c.logger.Error("Error unmarshaling consensus message", "error", err)
 			w.WriteHeader(500)
@@ -215,7 +400,7 @@ func (c *Node) getCommServer() *http3.Server {
 		c.logger.Debug("Node received consensus message", "nodeId", c.id, "from", message.From, "type", message.Type)
 
 		// Forward the message to the consensus system
-		err = c.consensus.HandleMessage(message.From, message)
+		err = c.consensus.HandleMessage(message.From, *message)
 		if err != nil {
 			c.logger.Error("Error handling consensus message", "error", err, "from", message.From, "type", message.Type)
 			w.WriteHeader(500)
@@ -263,7 +448,7 @@ func (n *Node) getOperationsServer() *http.Server {
 		// Get consensus status for additional information
 		consensusStatus := n.consensus.GetStatus()
 
-		// Determine shard leader from cluster configuration
+		// Determine shard leader from cluster configuration or consensus config
 		var shardLeader consensus.NodeID
 		var isShardLeader bool
 
@@ -360,6 +545,7 @@ func (n *Node) getOperationsServer() *http.Server {
 		}
 		ctx.JSON(200, gin.H{"height": block.Sequence})
 	})
+
 	muxOps.GET("/blocks/:blockNumber", func(ctx *gin.Context) {
 		blockNumberString := ctx.Param("blockNumber")
 		blockNumber, err := strconv.ParseUint(blockNumberString, 10, 64)
@@ -403,6 +589,14 @@ func (c *Node) Start() {
 			panic(err)
 		}
 	}()
+
+	// Start heartbeat services
+	c.startHeartbeatSender(5 * time.Second)
+	c.startHeartbeatMonitor(20 * time.Second)
+
+	// Start role update listener
+	go c.listenForRoleUpdates()
+
 	return
 }
 
@@ -413,9 +607,147 @@ func (c *Node) Stop() {
 	default:
 		close(c.stopChan)
 	}
+	close(c.roleUpdateChan)
 	c.clock.Stop()
 	c.doneWG.Wait()
 	// n.consensus.Stop()
+}
+
+// listenForRoleUpdates listens for role updates and restarts heartbeat monitor accordingly
+func (c *Node) listenForRoleUpdates() {
+	for {
+		select {
+		case newRole := <-c.roleUpdateChan:
+			c.logger.Info("Role update received", "oldRole", c.role.String(), "newRole", newRole.String())
+			c.updateRole(newRole)
+		case <-c.stopChan:
+			return
+		}
+	}
+}
+
+// updateRole updates the node's role and restarts heartbeat monitor if necessary
+func (c *Node) updateRole(newRole consensus.NodeRole) {
+	oldRole := c.role
+	c.role = newRole
+
+	// Update primary and shard leader IDs based on new role
+	if c.consensus != nil {
+		status := c.consensus.GetStatus()
+		// Primary ID is already set from cluster config, no need to update from status
+		if status.ShardID != 0 {
+			if shardLeaders := c.consensus.GetShardLeaders(); shardLeaders != nil {
+				if leader, exists := shardLeaders[status.ShardID]; exists {
+					c.shardLeaderId = leader
+				}
+			}
+		}
+	}
+
+	c.logger.Info("Node role updated",
+		"nodeID", c.id,
+		"oldRole", oldRole.String(),
+		"newRole", newRole.String(),
+		"primaryId", c.primaryId,
+		"shardLeaderId", c.shardLeaderId)
+
+	// Restart heartbeat monitor with new role
+	c.restartHeartbeatMonitor()
+}
+
+// restartHeartbeatMonitor stops the current heartbeat monitor and starts a new one
+func (c *Node) restartHeartbeatMonitor() {
+	c.logger.Info("Restarting heartbeat monitor with new role", "role", c.role.String())
+
+	// Stop current heartbeat monitor
+	c.stopHeartbeatMonitor()
+
+	// Start new heartbeat monitor with updated role
+	c.startHeartbeatMonitor(20 * time.Second)
+
+	c.logger.Info("Heartbeat monitor restarted", "role", c.role.String())
+}
+
+// UpdateNodeRole allows external components to update the node's role
+func (c *Node) UpdateNodeRole(newRole consensus.NodeRole) {
+	select {
+	case c.roleUpdateChan <- newRole:
+		// Role update sent successfully
+	default:
+		c.logger.Error("Role update channel is full, dropping update", "newRole", newRole.String())
+	}
+}
+
+// UpdateNodeConfig updates the node's configuration after leader election
+func (c *Node) UpdateNodeConfig(primaryId consensus.NodeID, shardLeaders map[consensus.ShardID]consensus.NodeID, shardNodes map[consensus.ShardID][]consensus.NodeID) {
+	c.primaryId = primaryId
+
+	// Update cluster config
+	c.config.primaryId = primaryId
+	for shardID, leaderID := range shardLeaders {
+		if nodes, exists := shardNodes[shardID]; exists {
+			c.config.shards[shardID] = Shard{
+				LeaderId:  leaderID,
+				Followers: nodes[1:], // First is leader, rest are followers
+			}
+		}
+	}
+
+	// Update this node's specific fields
+	if c.id == primaryId {
+		c.role = consensus.RolePrimaryLeader
+		c.shardId = 0
+		c.shardLeaderId = primaryId
+		c.followers = []consensus.NodeID{}
+		// Update config fields
+		c.role = consensus.RolePrimaryLeader
+
+	} else {
+		// Find which shard this node belongs to
+		for shardID, nodes := range shardNodes {
+			for i, nodeID := range nodes {
+				if nodeID == c.id {
+					c.shardId = shardID
+					if i == 0 {
+						c.role = consensus.RoleShardLeader
+						c.shardLeaderId = c.id
+						c.followers = nodes[1:]
+						// Update config fields
+
+						c.shardId = shardID
+					} else {
+						c.role = consensus.RoleShardFollower
+						c.shardLeaderId = nodes[0]
+						c.followers = []consensus.NodeID{}
+						// Update config fields
+
+						c.shardId = shardID
+					}
+					break
+				}
+			}
+		}
+	}
+
+	c.logger.Info("Node configuration updated after election",
+		"nodeID", c.id,
+		"role", c.role.String(),
+		"shardID", c.shardId,
+		"shardLeaderId", c.shardLeaderId,
+		"primaryId", c.primaryId,
+		"followers", c.followers)
+
+	// Restart heartbeat monitor with new configuration
+	c.restartHeartbeatMonitor()
+}
+
+// ReceiveHeartbeat implements ApplicationDelivery interface
+func (n *Node) ReceiveHeartbeat(from consensus.NodeID, timestamp time.Time) {
+	n.heartbeatMutex.Lock()
+	n.lastHeartbeats[from] = timestamp
+	n.heartbeatSeen[from] = true
+	n.heartbeatMutex.Unlock()
+	n.logger.Info("[Heartbeat] Received heartbeat from %s at %s", from, timestamp.Format(time.RFC3339))
 }
 
 func computeDigest(rawBytes []byte) string {

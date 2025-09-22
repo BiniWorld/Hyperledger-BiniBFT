@@ -21,6 +21,9 @@ type Consensus struct {
 	// View-based consensus management
 	currentViewObj *View
 
+	// Leader election management
+	leaderElection *LeaderElection
+
 	// Request pool for binibft processing
 	requestPool RequestPoolInterface
 
@@ -38,7 +41,6 @@ type Consensus struct {
 	metrics *ConsensusMetrics
 }
 
-// NewConsensus creates a new consensus instance
 func NewConsensus(config *Config) *Consensus {
 	submittedChan := make(chan struct{}, 1)
 	hc := &Consensus{
@@ -59,6 +61,21 @@ func NewConsensus(config *Config) *Consensus {
 	hc.currentViewObj = NewView(config.NodeID, config.ShardID, config)
 	hc.Batcher = NewBatchBuilder(hc.requestPool, submittedChan, config.RequestBatchMaxCount, config.RequestBatchMaxBytes, config.RequestBatchMaxInterval)
 
+	// Initialize leader election
+	hc.leaderElection = NewLeaderElection(config, 3) // Default to 3 shards, can be made configurable
+
+	// Node reference will be set later via SetNodeReference
+
+	// Set up leader election callbacks
+	hc.leaderElection.SetCallbacks(
+		func(primary NodeID, shards map[ShardID]NodeID) {
+			hc.handleLeaderElected(primary, shards)
+		},
+		func(shardID ShardID, leader NodeID, nodes []NodeID) {
+			hc.handleShardAssigned(shardID, leader, nodes)
+		},
+	)
+
 	return hc
 }
 
@@ -70,6 +87,15 @@ func (hc *Consensus) Start(ctx context.Context) error {
 
 	hc.isActive = true
 	hc.config.Network.RegisterHandler(hc)
+
+	// Leader election will be triggered on heartbeat failure, not at startup
+	// if hc.leaderElection != nil {
+	// 	if err := hc.leaderElection.Start(); err != nil {
+	// 		hc.config.Logger.Error("Failed to start leader election", "error", err)
+	// 		return fmt.Errorf("failed to start leader election: %v", err)
+	// 	}
+	// 	hc.config.Logger.Info("Leader election started", "nodeID", hc.config.NodeID)
+	// }
 
 	// Start batch processing only on primary leader
 	if hc.config.Role == RolePrimaryLeader {
@@ -100,6 +126,12 @@ func (hc *Consensus) Stop() error {
 
 	hc.isActive = false
 	close(hc.stopCh)
+
+	// Stop leader election
+	if hc.leaderElection != nil {
+		hc.leaderElection.Stop()
+		hc.config.Logger.Info("Leader election stopped", "nodeID", hc.config.NodeID)
+	}
 
 	// Reset view
 	if hc.currentViewObj != nil {
@@ -393,6 +425,64 @@ func (hc *Consensus) HandleMessage(from NodeID, message Message) error {
 				hc.config.Logger.Error("Failed to unmarshal intra-shard vote response payload", "error", err)
 			}
 		}
+	case MsgHeartbeat:
+		var heartbeatMsg HeartbeatMessage
+		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
+			if err := json.Unmarshal(payloadBytes, &heartbeatMsg); err == nil {
+				hc.config.Logger.Debug("Received heartbeat message", "from", message.From, "timestamp", heartbeatMsg.Timestamp)
+				if hc.config.Application != nil {
+					hc.config.Application.ReceiveHeartbeat(message.From, heartbeatMsg.Timestamp)
+				}
+				// Also forward to leader election for heartbeat monitoring
+				if hc.leaderElection != nil {
+					hc.leaderElection.ReceiveHeartbeat(message.From, heartbeatMsg.Timestamp)
+				}
+			} else {
+				hc.config.Logger.Error("Failed to unmarshal heartbeat payload", "error", err)
+			}
+		} else {
+			hc.config.Logger.Error("Failed to marshal heartbeat payload", "error", err)
+		}
+	case MsgLeaderElection:
+		if _, ok := message.Payload.(*LeaderElectionMessage); ok {
+			if hc.leaderElection != nil {
+				if err := hc.leaderElection.HandleMessage(message.From, message); err != nil {
+					hc.config.Logger.Error("Failed to handle leader election message", "error", err, "type", message.Type)
+				}
+			}
+		} else {
+			hc.config.Logger.Error("Invalid leader election message payload type", "expected", "*LeaderElectionMessage", "got", fmt.Sprintf("%T", message.Payload))
+		}
+	case MsgElectionAck:
+		if _, ok := message.Payload.(*ElectionAckMessage); ok {
+			if hc.leaderElection != nil {
+				if err := hc.leaderElection.HandleMessage(message.From, message); err != nil {
+					hc.config.Logger.Error("Failed to handle election ack message", "error", err, "type", message.Type)
+				}
+			}
+		} else {
+			hc.config.Logger.Error("Invalid election ack message payload type", "expected", "*ElectionAckMessage", "got", fmt.Sprintf("%T", message.Payload))
+		}
+	case MsgShardAssignment:
+		if _, ok := message.Payload.(*ShardAssignmentMessage); ok {
+			if hc.leaderElection != nil {
+				if err := hc.leaderElection.HandleMessage(message.From, message); err != nil {
+					hc.config.Logger.Error("Failed to handle shard assignment message", "error", err, "type", message.Type)
+				}
+			}
+		} else {
+			hc.config.Logger.Error("Invalid shard assignment message payload type", "expected", "*ShardAssignmentMessage", "got", fmt.Sprintf("%T", message.Payload))
+		}
+	case MsgLeaderAnnouncement:
+		if _, ok := message.Payload.(*LeaderAnnouncementMessage); ok {
+			if hc.leaderElection != nil {
+				if err := hc.leaderElection.HandleMessage(message.From, message); err != nil {
+					hc.config.Logger.Error("Failed to handle leader announcement message", "error", err, "type", message.Type)
+				}
+			}
+		} else {
+			hc.config.Logger.Error("Invalid leader announcement message payload type", "expected", "*LeaderAnnouncementMessage", "got", fmt.Sprintf("%T", message.Payload))
+		}
 	}
 	return nil
 }
@@ -509,6 +599,144 @@ func (hc *Consensus) handleFinalizedBlock(finalizedMsg *FinalizedBlockMessage) {
 		"nodeID", hc.config.NodeID)
 }
 
+// handleLeaderElected is called when a new primary leader is elected
+func (hc *Consensus) handleLeaderElected(primary NodeID, shards map[ShardID]NodeID) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+
+	hc.config.Logger.Info("Leader elected callback triggered",
+		"primaryLeader", primary,
+		"shardLeaders", shards,
+		"nodeID", hc.config.NodeID,
+		"currentRole", hc.config.Role.String())
+
+	// Update config with new leader information
+	hc.config.PrimaryLeader = primary
+	hc.config.ShardLeaders = shards
+
+	// Update shard nodes map if available from leader election
+	if hc.leaderElection != nil {
+		shardNodes := hc.leaderElection.GetShardAssignments()
+		if shardNodes != nil {
+			hc.config.ShardNodes = shardNodes
+		}
+	}
+
+	hc.config.Logger.Info("Updated leader information",
+		"primaryLeader", hc.config.PrimaryLeader,
+		"shardLeaders", hc.config.ShardLeaders,
+		"shardNodes", hc.config.ShardNodes)
+
+	// Update this node's role based on the election results
+	hc.updateNodeRole()
+
+	// If this node is now the primary leader, start batch processing
+	if hc.config.Role == RolePrimaryLeader {
+		if !hc.isActive {
+			hc.config.Logger.Info("This node became primary leader, starting batch processing")
+			hc.processBatch()
+		} else {
+			hc.config.Logger.Info("This node is already primary leader and active")
+		}
+	}
+}
+
+// handleShardAssigned is called when shards are assigned to leaders
+func (hc *Consensus) handleShardAssigned(shardID ShardID, leader NodeID, nodes []NodeID) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+
+	hc.config.Logger.Info("Shard assigned",
+		"shardID", shardID,
+		"leader", leader,
+		"nodes", nodes,
+		"nodeID", hc.config.NodeID)
+
+	// Update shard assignments in config
+	if hc.config.ShardNodes == nil {
+		hc.config.ShardNodes = make(map[ShardID][]NodeID)
+	}
+	hc.config.ShardNodes[shardID] = nodes
+
+	// Update this node's role if it's in this shard
+	hc.updateNodeRole()
+}
+
+// updateNodeRole updates this node's role based on current leader election results
+func (hc *Consensus) updateNodeRole() {
+	oldRole := hc.config.Role
+	oldShardID := hc.config.ShardID
+
+	hc.config.Logger.Info("Updating node role",
+		"nodeID", hc.config.NodeID,
+		"currentRole", oldRole.String(),
+		"currentShardID", oldShardID,
+		"primaryLeader", hc.config.PrimaryLeader,
+		"shardLeaders", hc.config.ShardLeaders,
+		"shardNodes", hc.config.ShardNodes)
+
+	if hc.config.NodeID == hc.config.PrimaryLeader {
+		hc.config.Role = RolePrimaryLeader
+		hc.config.ShardID = 0 // Primary leader not in a specific shard
+		hc.config.Logger.Info("Node became primary leader",
+			"nodeID", hc.config.NodeID,
+			"oldRole", oldRole.String(),
+			"newRole", hc.config.Role.String())
+	} else {
+		// Find which shard this node belongs to
+		for shardID, nodes := range hc.config.ShardNodes {
+			for _, nodeID := range nodes {
+				if nodeID == hc.config.NodeID {
+					hc.config.ShardID = shardID
+					if hc.config.ShardLeaders[shardID] == hc.config.NodeID {
+						hc.config.Role = RoleShardLeader
+					} else {
+						hc.config.Role = RoleShardFollower
+					}
+					hc.config.Logger.Info("Node assigned to shard",
+						"nodeID", hc.config.NodeID,
+						"shardID", hc.config.ShardID,
+						"shardLeader", hc.config.ShardLeaders[shardID],
+						"oldRole", oldRole.String(),
+						"newRole", hc.config.Role.String())
+					return
+				}
+			}
+		}
+		hc.config.Logger.Info("Node not found in any shard assignment",
+			"nodeID", hc.config.NodeID,
+			"shardNodes", hc.config.ShardNodes)
+	}
+
+	hc.config.Logger.Info("Node role update completed",
+		"nodeID", hc.config.NodeID,
+		"oldRole", oldRole.String(),
+		"newRole", hc.config.Role.String(),
+		"oldShardID", oldShardID,
+		"newShardID", hc.config.ShardID,
+		"primaryLeader", hc.config.PrimaryLeader)
+
+	// Notify the node about the role change so it can restart heartbeat monitor
+	if hc.config.Node != nil {
+		hc.config.Logger.Info("Notifying node about role change", "newRole", hc.config.Role.String())
+		hc.config.Node.UpdateNodeRole(hc.config.Role)
+	}
+}
+
+// TriggerLeaderElection triggers a new leader election process
+func (hc *Consensus) TriggerLeaderElection() error {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+
+	if hc.leaderElection == nil {
+		return fmt.Errorf("leader election not initialized")
+	}
+
+	hc.config.Logger.Info("Triggering leader election on heartbeat failure", "nodeID", hc.config.NodeID)
+	hc.leaderElection.StartElection()
+	return nil
+}
+
 // GetMetrics returns the current consensus metrics
 func (hc *Consensus) GetMetrics() map[string]interface{} {
 	hc.mu.RLock()
@@ -526,4 +754,20 @@ func (hc *Consensus) GetMetrics() map[string]interface{} {
 	// Finalized requests tracking is now handled by the view system
 
 	return baseMetrics
+}
+
+// SetNodeReference sets the node reference for role updates
+func (hc *Consensus) SetNodeReference(node interface{}) {
+	if nodeUpdater, ok := node.(NodeUpdater); ok {
+		hc.config.Node = nodeUpdater
+	} else {
+		hc.config.Logger.Error("Node does not implement NodeUpdater interface", "nodeType", fmt.Sprintf("%T", node))
+	}
+}
+
+// GetShardLeaders returns the current shard leaders
+func (hc *Consensus) GetShardLeaders() map[ShardID]NodeID {
+	hc.mu.RLock()
+	defer hc.mu.RUnlock()
+	return hc.config.ShardLeaders
 }

@@ -211,6 +211,8 @@ type Config struct {
 	Application ApplicationDelivery
 	// Signer for signing proposals and messages
 	Signer Signer
+	// Node reference for role updates
+	Node NodeUpdater // Interface for node role updates
 }
 
 // ConsensusInterface defines the main consensus operations
@@ -244,12 +246,19 @@ type Logger interface {
 // ApplicationDelivery interface for delivering finalized proposals to the application
 type ApplicationDelivery interface {
 	Deliver(proposal Proposal) error
+	ReceiveHeartbeat(from NodeID, timestamp time.Time)
 }
 
 // Signer interface for signing proposals and messages
 type Signer interface {
 	SignProposal(proposal Proposal, data []byte) *Signature
 	Sign(msg []byte) []byte
+}
+
+// NodeUpdater interface for updating node roles and configuration
+type NodeUpdater interface {
+	UpdateNodeRole(newRole NodeRole)
+	UpdateNodeConfig(primaryId NodeID, shardLeaders map[ShardID]NodeID, shardNodes map[ShardID][]NodeID)
 }
 
 // Status represents the current status of the consensus

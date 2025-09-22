@@ -24,6 +24,10 @@ const (
 	MsgFinalizedBlock
 	MsgIntraShardVote
 	MsgIntraShardVoteResponse
+	MsgLeaderElection
+	MsgElectionAck
+	MsgShardAssignment
+	MsgLeaderAnnouncement
 )
 
 // Message represents a consensus message
@@ -176,4 +180,42 @@ type IntraShardVoteResponse struct {
 	Vote      bool // true for approve, false for reject
 	Signature []byte
 	Timestamp time.Time
+}
+
+// LeaderElectionMessage for initiating leader election
+type LeaderElectionMessage struct {
+	ElectionID   string
+	CandidateID  NodeID
+	ActiveNodes  []NodeID
+	Timestamp    time.Time
+	Signature    []byte
+}
+
+// ElectionAckMessage for acknowledging election participation
+type ElectionAckMessage struct {
+	ElectionID   string
+	NodeID       NodeID
+	Acknowledged bool
+	Timestamp    time.Time
+	Signature    []byte
+}
+
+// ShardAssignmentMessage for announcing shard assignments and leaders
+type ShardAssignmentMessage struct {
+	ElectionID     string
+	PrimaryLeader  NodeID
+	ShardLeaders   map[ShardID]NodeID
+	ShardNodes     map[ShardID][]NodeID
+	Timestamp      time.Time
+	Signature      []byte
+}
+
+// LeaderAnnouncementMessage for announcing new leaders
+type LeaderAnnouncementMessage struct {
+	ElectionID    string
+	PrimaryLeader NodeID
+	ShardLeaders  map[ShardID]NodeID
+	ShardNodes    map[ShardID][]NodeID
+	Timestamp     time.Time
+	Signature     []byte
 }

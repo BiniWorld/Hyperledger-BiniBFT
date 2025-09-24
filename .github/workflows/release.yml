@@ -1,0 +1,238 @@
+# Copyright the Hyperledger Fabric contributors. All rights reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release
+
+on:
+  workflow_dispatch: # workflow_dispatch must be enabled in main branch to support release action on older release branches
+  push:
+    tags:
+      - v2.*
+      - v3.*
+
+env:
+  UBUNTU_VER: 24.04
+  FABRIC_VER: ${{ github.ref_name }}
+
+permissions:
+  contents: read
+
+jobs:
+  build-binaries:
+    name: Build Fabric Binaries
+    strategy:
+      matrix:
+        include:
+          - image: ubuntu-24.04
+            target: linux
+            arch: amd64
+          - image: ubuntu-24.04
+            target: linux
+            arch: arm64
+          - image: macos-11
+            target: darwin
+            arch: amd64
+          - image: macos-11
+            target: darwin
+            arch: arm64
+          - image: fabric-windows-latest
+            target: windows
+            arch: amd64
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Fabric Code
+        uses: actions/checkout@v4
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Compile Binary and Create Tarball
+        run: ./ci/scripts/create_binary_package.sh
+        env:
+          TARGET: ${{ matrix.target }}-${{ matrix.arch }}
+          RELEASE: ${{ env.FABRIC_VER }}
+
+      - name: Publish Release Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # <name> of the artifact must not collide between platform/arch builds
+          name: release-${{ matrix.target }}-${{ matrix.arch }}
+          # <path> of the artifact may include multiple files.
+          path: release/${{ matrix.target }}-${{ matrix.arch }}/*.tar.gz
+
+  # build native images using a different runner for each architecture (faster and more reliable than using qemu to build multi-architecture images on ubuntu-24.04)
+  build-and-push-native-docker-images:
+    name: Build and Push native images
+    runs-on: ${{ matrix.runner }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-24.04 # creates linux-amd64 images
+          - ubuntu-24.04-arm # creates linux-arm64 images
+
+        # Dynamic matrix
+        # If owner is 'hyperledger' run job for Docker Hub and ghcr, otherwise for personal forks just run job for ghcr
+        registry: ${{ fromJSON(github.repository_owner == 'hyperledger' && '["docker.io", "ghcr.io"]' || '["ghcr.io"]') }}
+
+        component:
+          - name: baseos
+            context: images/baseos
+          - name: ccenv
+            context: images/ccenv
+          - name: peer
+            context: .
+          - name: orderer
+            context: .
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set GO_VER environment variable from go.mod
+        run: |
+          awk '/^go[ /t]/ { gsub(/^go[ \t]+|[ \t]+^/, ""); print "GO_VER="$0; exit }' < go.mod >> "${GITHUB_ENV}"
+
+      - name: Login to the ${{ matrix.registry }} Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ matrix.registry }}
+          username: ${{ matrix.registry == 'docker.io' && secrets.DOCKERHUB_USERNAME || github.actor }}
+          password: ${{ matrix.registry == 'docker.io' && secrets.DOCKERHUB_TOKEN    || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.registry }}/${{ github.repository_owner }}/fabric-${{ matrix.component.name }}
+
+      - name: Build and push ${{ matrix.component.name }} Image
+        id: build-and-push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.component.context }}
+          file: images/${{ matrix.component.name }}/Dockerfile
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            FABRIC_VER=${{ env.FABRIC_VER }}
+            UBUNTU_VER=${{ env.UBUNTU_VER }}
+            GO_VER=${{ env.GO_VER }}
+            GO_TAGS=
+          outputs: type=image,"name=${{ matrix.registry }}/${{ github.repository_owner }}/fabric-${{ matrix.component.name }}",push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests/${{ matrix.registry }}/${{ matrix.component.name }}
+          digest="${{ steps.build-and-push.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${{ matrix.registry }}/${{ matrix.component.name }}/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.registry }}-${{ matrix.component.name }}-${{ matrix.runner }}
+          path: ${{ runner.temp }}/digests/${{ matrix.registry }}/${{ matrix.component.name }}/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # This job merges the architecture-specific digests for the images created above
+  # and creates a multi-architecture image manifest with user-friendly tags
+  merge-and-push-multi-arch-image:
+    name: Merge and Push multi-arch image
+    runs-on: ubuntu-24.04
+    needs:
+      - build-and-push-native-docker-images
+
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Dynamic matrix
+        # If owner is 'hyperledger' run job for Docker Hub and ghcr, otherwise for personal forks just run job for ghcr
+        registry: ${{ fromJSON(github.repository_owner == 'hyperledger' && '["docker.io", "ghcr.io"]' || '["ghcr.io"]') }}
+
+        component:
+          - name: baseos
+            context: images/baseos
+          - name: ccenv
+            context: images/ccenv
+          - name: peer
+            context: .
+          - name: orderer
+            context: .
+
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests/${{ matrix.registry }}/${{ matrix.component.name }}
+          pattern: digests-${{ matrix.registry }}-${{ matrix.component.name }}-*
+          merge-multiple: true
+
+      - name: Login to the ${{ matrix.registry }} Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ matrix.registry }}
+          username: ${{ matrix.registry == 'docker.io' && secrets.DOCKERHUB_USERNAME || github.actor }}
+          password: ${{ matrix.registry == 'docker.io' && secrets.DOCKERHUB_TOKEN    || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.registry }}/${{ github.repository_owner }}/fabric-${{ matrix.component.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}.{{minor}}.{{patch}}
+
+      - name: Create manifest list and push # combines the downloaded amd64 and arm64 digests and pushes multi-architecture manifest with the tags specified above
+        working-directory: ${{ runner.temp }}/digests/${{ matrix.registry }}/${{ matrix.component.name }}
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ matrix.registry }}/${{ github.repository_owner }}/fabric-${{ matrix.component.name }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ matrix.registry }}/${{ github.repository_owner }}/fabric-${{ matrix.component.name }}:${{ steps.meta.outputs.version }}
+
+  create-release:
+    name: Create GitHub Release
+    needs:
+      - build-binaries
+      - merge-and-push-multi-arch-image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Fabric Code
+        uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        id: download
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "release-*"
+
+      - name: Release Fabric Version
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: "true"
+          artifacts: "release-*-*/*.tar.gz"
+          bodyFile: release_notes/${{ env.FABRIC_VER }}.md
+          tag: ${{ env.FABRIC_VER }}
+          token: ${{ secrets.GITHUB_TOKEN }}

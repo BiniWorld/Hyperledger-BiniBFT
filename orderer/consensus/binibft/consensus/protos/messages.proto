@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+
+option go_package = "binibft-poc/consensus/protos";
+
+package binibftprotos;
+
+message ViewMetadata {
+    uint64 view_id = 1;
+    uint64 latest_sequence = 2;
+    uint64 decisions_in_view = 3;
+    repeated uint64 black_list = 4;
+    bytes prev_commit_signature_digest = 5;
+}

@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+option go_package = "github.com/hyperledger/fabric/orderer/consensus/binibft";
+
+package binibft;
+
+// BiniBFTOptions contains configuration for BiniBFT consensus
+message BiniBFTOptions {
+    // Request batching configuration
+    uint64 request_batch_max_count = 1;
+    uint64 request_batch_max_bytes = 2;
+    string request_batch_max_interval = 3;
+    
+    // Message buffer and pool configuration
+    uint64 incoming_message_buffer_size = 4;
+    uint64 request_pool_size = 5;
+    
+    // Timeout configurations
+    string request_forward_timeout = 6;
+    string request_complain_timeout = 7;
+    string request_auto_remove_timeout = 8;
+    string view_change_resend_interval = 9;
+    string view_change_timeout = 10;
+    string leader_heartbeat_timeout = 11;
+    uint64 leader_heartbeat_count = 12;
+    string collect_timeout = 13;
+    string request_pool_submit_timeout = 14;
+    
+    // BiniBFT specific configurations
+    bool sync_on_start = 15;
+    bool speed_up_view_change = 16;
+    bool leader_rotation = 17;
+    uint64 decisions_per_leader = 18;
+    uint64 request_max_bytes = 19;
+    
+    // Hierarchical sharding configuration
+    double shard_majority_threshold = 20;
+    double cross_shard_threshold = 21;
+    uint64 batch_size = 22;
+    string max_batch_delay = 23;
+    
+    // Shard configuration
+    repeated ShardConfig shards = 24;
+    uint64 primary_leader = 25;
+    uint64 max_faulty_nodes = 26;
+}
+
+// ShardConfig defines configuration for a single shard
+message ShardConfig {
+    uint64 shard_id = 1;
+    uint64 leader = 2;
+    repeated uint64 followers = 3;
+    repeated uint64 nodes = 4;
+}

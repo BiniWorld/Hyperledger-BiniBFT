@@ -109,18 +109,24 @@ func (c *BiniBFTConsensus) Stop() error {
 // SubmitRequest submits a new client request for consensus
 func (c *BiniBFTConsensus) SubmitRequest(request []byte) error {
 	if !c.isActive {
+		c.Logger.Error("Consensus not active - cannot submit request")
 		return fmt.Errorf("consensus not active")
 	}
 
-	c.Logger.Info("Submitting request",
-		"role", c.nodeRole.String(),
-		"nodeID", c.Config.SelfID)
+	c.Logger.Info("Submitting request to BiniBFT consensus engine")
 
 	// Submit to BiniBFT consensus
 	if c.consensus != nil {
-		return c.consensus.SubmitRequest(request)
+		err := c.consensus.SubmitRequest(request)
+		if err != nil {
+			c.Logger.Error("Failed to submit request to consensus engine", "error", err)
+		}
+		c.Logger.Info("Successfully submitted request to consensus engine")
+
+		return err
 	}
 
+	c.Logger.Error("Consensus engine not initialized")
 	return fmt.Errorf("consensus not initialized")
 }
 
@@ -201,7 +207,7 @@ func (c *BiniBFTConsensus) createBiniBFTConfig() *binibftconsensus.Config {
 		CrossShardThreshold:     0.67,
 		BatchSize:               int(c.Config.RequestBatchMaxCount),
 		MaxBatchDelay:           c.Config.RequestBatchMaxInterval,
-		Application:             &FabricApplicationAdapter{app: c.Application},
+		Application:             &FabricApplicationAdapter{app: c.Application, logger: c.Logger},
 		Assembler:               &FabricAssemblerAdapter{assembler: c.Assembler},
 		Signer:                  &FabricSignerAdapter{signer: c.Signer},
 		RequestInspector:        &FabricRequestInspectorAdapter{},

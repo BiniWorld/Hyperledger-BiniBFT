@@ -135,8 +135,7 @@ func New(
 		},
 	}
 
-	// Note: ClusterNodeService registration is handled by smartbft to avoid duplicate registration
-	// ab.RegisterClusterNodeServiceServer(srv.Server(), consenter.ClusterService)
+	// Note: ClusterNodeService registration is handled centrally in server/main.go to avoid duplicate registration
 
 	return consenter
 }
@@ -192,7 +191,7 @@ func (c *Consenter) HandleChain(support consensus.ConsenterSupport, metadata *cb
 		c.ClusterDialer,
 		c.Conf.General.Cluster,
 		c.Comm,
-		c.SignerSerializer,
+		support, // Use support as signer - it implements SignerSerializer and has the correct OrdererMSP identity
 		c.GetPolicyManager(support.ChannelID()),
 		support,
 		c.Metrics,

@@ -63,6 +63,7 @@ var (
 	clusterTypes = map[string]struct{}{
 		"etcdraft": {},
 		"BFT":      {},
+		"binibft":  {},
 	}
 )
 
@@ -634,8 +635,38 @@ func initializeMultichannelRegistrar(
 	// the orderer can start without channels at all and have an initialized cluster type consenter
 	etcdraftConsenter, clusterMetrics := etcdraft.New(clusterDialer, conf, srvConf, srv, registrar, metricsProvider, bccsp)
 	consenters["etcdraft"] = etcdraftConsenter
-	consenters["BFT"] = smartbft.New(dpmr.Registry(), signer, clusterDialer, conf, srvConf, srv, registrar, metricsProvider, clusterMetrics, bccsp)
-	consenters["binibft"] = binibft.New(dpmr.Registry(), signer, clusterDialer, conf, srvConf, srv, registrar, metricsProvider, clusterMetrics, bccsp)
+
+	// Create BFT consensus mechanisms
+	smartbftConsenter := smartbft.New(dpmr.Registry(), signer, clusterDialer, conf, srvConf, srv, registrar, metricsProvider, clusterMetrics, bccsp)
+	binibftConsenter := binibft.New(dpmr.Registry(), signer, clusterDialer, conf, srvConf, srv, registrar, metricsProvider, clusterMetrics, bccsp)
+
+	consenters["BFT"] = smartbftConsenter
+	consenters["binibft"] = binibftConsenter
+
+	// Create a unified cluster service that can route to both BFT consensus mechanisms
+	unifiedClusterService := &cluster.ClusterService{
+		StreamCountReporter: &cluster.StreamCountReporter{
+			Metrics: clusterMetrics,
+		},
+		Logger:                           flogging.MustGetLogger("orderer.common.cluster"),
+		StepLogger:                       flogging.MustGetLogger("orderer.common.cluster.step"),
+		MinimumExpirationWarningInterval: cluster.MinimumExpirationWarningInterval,
+		CertExpWarningThreshold:          conf.General.Cluster.CertExpirationWarningThreshold,
+		MembershipByChannel:              make(map[string]*cluster.ChannelMembersConfig),
+		NodeIdentity:                     smartbftConsenter.Identity,
+		RequestHandler: &MultiplexingHandler{
+			SmartBFTHandler: smartbftConsenter.ClusterService.RequestHandler,
+			BiniBFTHandler:  binibftConsenter.ClusterService.RequestHandler,
+			Registrar:       registrar,
+		},
+	}
+
+	// Update both consenters to use the unified cluster service
+	smartbftConsenter.ClusterService = unifiedClusterService
+	binibftConsenter.ClusterService = unifiedClusterService
+
+	// Register the unified cluster service
+	ab.RegisterClusterNodeServiceServer(srv.Server(), unifiedClusterService)
 
 	registrar.Initialize(consenters)
 	return registrar

@@ -23,10 +23,10 @@ func NewConsensusBuilder() *ConsensusBuilder {
 			ShardLeaders:           make(map[ShardID]NodeID),
 			ShardMajorityThreshold: 0.67,
 			CrossShardThreshold:    0.51,
-			Timeout:                5 * time.Second,
-			ViewChangeTimeout:      30 * time.Second,
-			BatchSize:              10,
-			MaxBatchDelay:          500 * time.Millisecond,
+			Timeout:                5 * time.Minute,        // Match SmartBFT's generous timeout
+			ViewChangeTimeout:      3 * time.Minute,        // Match SmartBFT's generous timeout
+			BatchSize:              1,                      // Reduced for faster single transaction processing
+			MaxBatchDelay:          100 * time.Millisecond, // Very fast response for single transactions
 		},
 	}
 }

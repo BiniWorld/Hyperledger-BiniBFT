@@ -3,7 +3,9 @@ package consensus
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -144,8 +146,18 @@ func (v *View) Propose(proposal Proposal) error {
 
 	// Only primary leader can start pre-prepare
 	if v.config.Role != RolePrimaryLeader {
+		v.logger.Error("Non-primary leader attempted to propose",
+			"nodeID", v.config.NodeID,
+			"role", v.config.Role.String(),
+			"primaryLeader", v.config.PrimaryLeader,
+			"sequence", v.Sequence)
 		return fmt.Errorf("only primary leader can start pre-prepare")
 	}
+
+	v.logger.Info("Primary leader starting proposal",
+		"nodeID", v.config.NodeID,
+		"sequence", v.Sequence,
+		"proposalSize", len(proposal.Payload))
 
 	v.logger.Info("Primary leader starting consensus for proposal",
 		"view", v.Number,
@@ -421,6 +433,13 @@ func (v *View) HandleShardAck(ack *ShardAckMessage) error {
 	}
 	v.shardAcks[ack.Sequence][ack.NodeID] = ack
 
+	v.logger.Info("Received shard ACK",
+		"sequence", ack.Sequence,
+		"phase", ack.Phase,
+		"from", ack.NodeID,
+		"hasSignature", len(ack.Signature) > 0,
+		"signatureLength", len(ack.Signature))
+
 	vote := &Vote{
 		NodeID:  ack.NodeID,
 		ShardID: ack.ShardID,
@@ -436,7 +455,14 @@ func (v *View) HandleShardAck(ack *ShardAckMessage) error {
 
 	// Special handling for primary leader receiving commit ACKs from shard leaders
 	if v.config.Role == RolePrimaryLeader && ack.Phase == "commit" {
-		v.checkPrimaryCommitQuorum(ack.Sequence)
+		// Only check quorum if sequence is not already finalized
+		if !v.finalizedSequences[ack.Sequence] {
+			v.checkPrimaryCommitQuorum(ack.Sequence)
+		} else {
+			v.logger.Debug("Ignoring commit ACK for already finalized sequence",
+				"sequence", ack.Sequence,
+				"from", ack.NodeID)
+		}
 	}
 
 	return nil
@@ -686,8 +712,12 @@ func (v *View) startPreparePhaseWithShardLeaders(sequence uint64) {
 }
 
 func (v *View) signMessage(data []byte) []byte {
-	// Simple signature - in production use proper cryptographic signature
-	return []byte(fmt.Sprintf("sig-%s", string(data)))
+	if v.config.Signer != nil {
+		return v.config.Signer.Sign(data)
+	}
+	// Fallback if no signer available
+	v.logger.Error("No signer available for signing message")
+	return []byte{}
 }
 
 // signProposalForCommit uses the proper signer for commit phase
@@ -698,8 +728,45 @@ func (v *View) signProposalForCommit(proposal Proposal) []byte {
 			return signature.Value
 		}
 	}
-	// Fallback to simple signature
+	// Fallback to proper signature using signer
+	if v.config.Signer != nil {
+		return v.config.Signer.Sign(proposal.Payload)
+	}
+	// Last resort: sign the message directly
 	return v.signMessage(proposal.Payload)
+}
+
+// validateIntraShardVote validates an intra-shard vote request
+func (v *View) validateIntraShardVote(voteMsg *IntraShardVoteMessage) bool {
+	// Check if the node is in our shard
+	shardNodes := v.config.ShardNodes[v.config.ShardID]
+	nodeInShard := false
+	for _, nodeID := range shardNodes {
+		if nodeID == voteMsg.NodeID {
+			nodeInShard = true
+			break
+		}
+	}
+	if !nodeInShard {
+		v.config.Logger.Error("Vote from node not in shard", "nodeID", voteMsg.NodeID, "shardID", v.config.ShardID)
+		return false
+	}
+
+	// Check if sequence is already finalized
+	if v.finalizedSequences[voteMsg.Sequence] {
+		v.config.Logger.Debug("Vote for already finalized sequence", "sequence", voteMsg.Sequence)
+		return false
+	}
+
+	// Check if we have the request info for this sequence
+	if _, exists := v.inFlightRequests[voteMsg.Sequence]; !exists {
+		v.config.Logger.Error("Vote for unknown proposal sequence", "sequence", voteMsg.Sequence)
+		return false
+	}
+
+	// Additional validation could include signature verification
+	// For now, accept valid shard members
+	return true
 }
 
 // broadcastToShardNodes broadcasts a message to other nodes in the same shard for intra-shard consensus
@@ -776,14 +843,46 @@ func (v *View) HandleIntraShardVote(voteMsg *IntraShardVoteMessage) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
+	// Early check for already finalized sequences to reduce noise
+	if v.finalizedSequences[voteMsg.Sequence] {
+		v.logger.Debug("Received vote request for already finalized sequence",
+			"sequence", voteMsg.Sequence,
+			"phase", voteMsg.Phase,
+			"from", voteMsg.NodeID)
+
+		// Still send a response but with vote=false
+		response := &IntraShardVoteResponse{
+			Sequence:  voteMsg.Sequence,
+			Phase:     voteMsg.Phase,
+			ShardID:   v.config.ShardID,
+			NodeID:    v.config.NodeID,
+			Vote:      false,
+			Timestamp: time.Now(),
+		}
+
+		msg := Message{
+			Type:      MsgIntraShardVoteResponse,
+			From:      v.config.NodeID,
+			To:        voteMsg.NodeID,
+			ShardID:   v.config.ShardID,
+			Timestamp: time.Now(),
+			Payload:   response,
+		}
+
+		v.config.Network.Send(voteMsg.NodeID, msg)
+		v.logger.Debug("Sent rejection response for already finalized sequence",
+			"sequence", voteMsg.Sequence,
+			"to", voteMsg.NodeID)
+		return nil
+	}
+
 	v.logger.Info("Handling intra-shard vote request",
 		"sequence", voteMsg.Sequence,
 		"phase", voteMsg.Phase,
 		"from", voteMsg.NodeID)
 
-	// Validate the vote request (basic validation)
-	// In production, you'd verify signatures, check proposal validity, etc.
-	vote := true // For now, always vote yes
+	// Validate the vote request with proper validation
+	vote := v.validateIntraShardVote(voteMsg)
 
 	// Send vote response back
 	response := &IntraShardVoteResponse{
@@ -806,11 +905,18 @@ func (v *View) HandleIntraShardVote(voteMsg *IntraShardVoteMessage) error {
 	}
 
 	v.config.Network.Send(voteMsg.NodeID, msg)
-	v.logger.Info("Sent intra-shard vote response",
-		"sequence", voteMsg.Sequence,
-		"phase", voteMsg.Phase,
-		"vote", vote,
-		"to", voteMsg.NodeID)
+	if vote {
+		v.logger.Info("Sent intra-shard vote response (approved)",
+			"sequence", voteMsg.Sequence,
+			"phase", voteMsg.Phase,
+			"to", voteMsg.NodeID)
+	} else {
+		v.logger.Info("Sent intra-shard vote response (rejected)",
+			"sequence", voteMsg.Sequence,
+			"phase", voteMsg.Phase,
+			"to", voteMsg.NodeID,
+			"reason", "validation failed")
+	}
 
 	return nil
 }
@@ -849,7 +955,9 @@ func (v *View) recordIntraShardVote(sequence uint64, phase string, nodeID NodeID
 // checkIntraShardMajority checks if we have majority votes and sends ACK to shard leader
 func (v *View) checkIntraShardMajority(sequence uint64, phase string) {
 	shardNodes := v.config.ShardNodes[v.config.ShardID]
-	requiredCount := (len(shardNodes) / 2) + 1 // Simple majority
+	// Use BFT threshold: need 2f+1 votes where f is max faulty nodes
+	// For n nodes, f = (n-1)/3, so we need 2*((n-1)/3)+1 = (2n+1)/3 votes
+	requiredCount := (2*len(shardNodes) + 2) / 3 // BFT majority threshold
 
 	votes, exists := v.intraShardVotes[sequence][phase]
 	if !exists {
@@ -1135,12 +1243,30 @@ func (v *View) sendCommitAckToShardLeader(sequence uint64) {
 
 // sendCommitAckToPrimary sends commit acknowledgment from shard leader to primary leader
 func (v *View) sendCommitAckToPrimary(sequence uint64) {
+	// Get the proposal for this sequence to create signature
+	var proposal Proposal
+	if commitMsgs, exists := v.commitMessages[sequence]; exists {
+		for _, msg := range commitMsgs {
+			proposal = msg.Proposal
+			break
+		}
+	} else if prepareMsgs, exists := v.prepareMessages[sequence]; exists {
+		for _, msg := range prepareMsgs {
+			proposal = msg.Proposal
+			break
+		}
+	}
+
+	// Create signature for the proposal
+	signature := v.signProposalForCommit(proposal)
+
 	ack := &ShardAckMessage{
 		Sequence:     sequence,
 		ShardID:      v.config.ShardID,
 		NodeID:       v.config.NodeID,
 		Acknowledged: true,
 		Phase:        "commit",
+		Signature:    signature,
 		Timestamp:    time.Now(),
 	}
 
@@ -1154,14 +1280,21 @@ func (v *View) sendCommitAckToPrimary(sequence uint64) {
 	}
 
 	v.config.Network.Send(v.config.PrimaryLeader, msg)
-	v.logger.Info("Sent commit ACK to primary leader",
+	v.logger.Info("Sent commit ACK with signature to primary leader",
 		"sequence", sequence,
 		"primaryLeader", v.config.PrimaryLeader,
-		"fromShardLeader", v.config.NodeID)
+		"fromShardLeader", v.config.NodeID,
+		"signatureLength", len(signature))
 }
 
 // checkPrimaryCommitQuorum checks if majority of shard leaders have committed
 func (v *View) checkPrimaryCommitQuorum(sequence uint64) {
+	// Skip if sequence is already finalized
+	if v.finalizedSequences[sequence] {
+		v.logger.Debug("Skipping primary commit quorum check for already finalized sequence", "sequence", sequence)
+		return
+	}
+
 	// Count commit ACKs from shard leaders
 	commitAckCount := 0
 	if acks, exists := v.shardAcks[sequence]; exists {
@@ -1211,6 +1344,121 @@ func (v *View) checkPrimaryCommitQuorum(sequence uint64) {
 		}
 		v.finalizeProposalAndCreateBlock(sequence, proposal)
 	}
+}
+
+// collectSignaturesForSequence collects all signatures from consensus messages for the given sequence
+func (v *View) collectSignaturesForSequence(sequence uint64, proposal Proposal) []Signature {
+	var signatures []Signature
+
+	// Create proper block signatures using the signer (like SmartBFT)
+	// This ensures the signatures are in the correct format for peer validation
+	if v.config.Signer != nil {
+		// Create signature for current node using the proposal directly
+		signature := v.config.Signer.SignProposal(proposal, nil)
+		if signature != nil {
+			signatures = append(signatures, *signature)
+		}
+
+		// TODO: In a full BFT implementation, we would collect signatures from other nodes
+		// For now, we create a single signature which may not satisfy the peer's policy
+		signerID := uint64(0)
+		if signature != nil {
+			signerID = signature.ID
+		}
+		v.logger.Info("Created block signature for consensus",
+			"sequence", sequence,
+			"signerID", signerID,
+			"signatureCount", len(signatures))
+	}
+
+	// Collect signatures from commit messages
+	if commitMsgs, exists := v.commitMessages[sequence]; exists {
+		for nodeID, msg := range commitMsgs {
+			if len(msg.Signature) > 0 {
+				// Convert NodeID string to uint64
+				nodeIDUint := v.nodeIDToUint64(nodeID)
+				signatures = append(signatures, Signature{
+					ID:    nodeIDUint,
+					Value: msg.Signature,
+					Msg:   proposal.Payload,
+				})
+			}
+		}
+	}
+
+	// Collect signatures from shard acknowledgments (commit phase)
+	if shardAcks, exists := v.shardAcks[sequence]; exists {
+		for nodeID, ack := range shardAcks {
+			if ack.Phase == "commit" && len(ack.Signature) > 0 {
+				// Convert NodeID string to uint64
+				nodeIDUint := v.nodeIDToUint64(nodeID)
+				signatures = append(signatures, Signature{
+					ID:    nodeIDUint,
+					Value: ack.Signature,
+					Msg:   proposal.Payload,
+				})
+			}
+		}
+	}
+
+	// Detailed logging to debug signature collection
+	v.logger.Info("=== SIGNATURE COLLECTION DEBUG ===")
+	v.logger.Info("Collecting signatures for sequence", "sequence", sequence)
+
+	// Log pre-prepare signatures
+	if prePrepMsgs, exists := v.prePrepMessages[sequence]; exists {
+		for nodeID, msg := range prePrepMsgs {
+			v.logger.Info("PrePrep signature", "nodeID", nodeID, "hasSignature", len(msg.Signature) > 0, "sigLength", len(msg.Signature))
+		}
+	}
+
+	// Log prepare signatures
+	if prepareMsgs, exists := v.prepareMessages[sequence]; exists {
+		for nodeID, msg := range prepareMsgs {
+			v.logger.Info("Prepare signature", "nodeID", nodeID, "hasSignature", len(msg.Signature) > 0, "sigLength", len(msg.Signature))
+		}
+	}
+
+	// Log commit signatures
+	if commitMsgs, exists := v.commitMessages[sequence]; exists {
+		for nodeID, msg := range commitMsgs {
+			v.logger.Info("Commit signature", "nodeID", nodeID, "hasSignature", len(msg.Signature) > 0, "sigLength", len(msg.Signature))
+		}
+	}
+
+	// Log shard ACK signatures
+	if shardAcks, exists := v.shardAcks[sequence]; exists {
+		for nodeID, ack := range shardAcks {
+			v.logger.Info("ShardAck signature", "nodeID", nodeID, "phase", ack.Phase, "hasSignature", len(ack.Signature) > 0, "sigLength", len(ack.Signature))
+		}
+	}
+
+	v.logger.Info("Final signature collection",
+		"sequence", sequence,
+		"totalSignatures", len(signatures),
+		"signatureIDs", func() []uint64 {
+			var ids []uint64
+			for _, sig := range signatures {
+				ids = append(ids, sig.ID)
+			}
+			return ids
+		}())
+	v.logger.Info("=== END SIGNATURE COLLECTION DEBUG ===")
+
+	return signatures
+}
+
+// nodeIDToUint64 converts NodeID string to uint64
+func (v *View) nodeIDToUint64(nodeID NodeID) uint64 {
+	// Try to parse as numeric first
+	if id, err := strconv.ParseUint(string(nodeID), 10, 64); err == nil {
+		return id
+	}
+
+	// If not numeric, use SHA256 hash for consistent conversion
+	hash := sha256.Sum256([]byte(nodeID))
+	// Use first 8 bytes of hash as uint64
+	return binary.BigEndian.Uint64(hash[:8])
 }
 
 // storeProposalAsBlock stores a finalized proposal as a block
@@ -1502,17 +1750,18 @@ func (v *View) checkIntraShardSequenceQuorum(tracker *SequenceVoteTracker, phase
 }
 
 // forwardFinalizedBlockToFollowers forwards finalized blocks to shard followers
-func (v *View) forwardFinalizedBlockToFollowers(sequence uint64, proposal Proposal) {
+func (v *View) forwardFinalizedBlockToFollowers(sequence uint64, proposal Proposal, signatures []Signature) {
 	shardNodes := v.config.ShardNodes[v.config.ShardID]
 	for _, nodeID := range shardNodes {
 		if nodeID != v.config.NodeID { // Don't send to self
 			// Create a finalized block message for followers
 			finalizedMsg := &FinalizedBlockMessage{
-				Sequence:  sequence,
-				Proposal:  proposal,
-				ShardID:   v.config.ShardID,
-				LeaderID:  v.config.NodeID,
-				Timestamp: time.Now(),
+				Sequence:   sequence,
+				Proposal:   proposal,
+				ShardID:    v.config.ShardID,
+				LeaderID:   v.config.NodeID,
+				Timestamp:  time.Now(),
+				Signatures: signatures, // Include signatures from consensus
 			}
 
 			msg := Message{
@@ -1558,9 +1807,12 @@ func (v *View) finalizeProposalAndCreateBlock(sequence uint64, proposal Proposal
 		"nodeID", v.config.NodeID,
 		"currentSequence", v.Sequence)
 
+	// Collect signatures from consensus messages for this sequence
+	signatures := v.collectSignaturesForSequence(sequence, proposal)
+
 	// Deliver proposal to application for block creation and storage
 	if v.config.Application != nil {
-		if err := v.config.Application.Deliver(proposal); err != nil {
+		if err := v.config.Application.Deliver(proposal, signatures); err != nil {
 			v.logger.Error("Failed to deliver proposal to application",
 				"error", err,
 				"sequence", sequence)
@@ -1572,7 +1824,7 @@ func (v *View) finalizeProposalAndCreateBlock(sequence uint64, proposal Proposal
 
 	// If this is a shard leader, forward the finalized block to followers
 	if v.config.Role == RoleShardLeader {
-		v.forwardFinalizedBlockToFollowers(sequence, proposal)
+		v.forwardFinalizedBlockToFollowers(sequence, proposal, signatures)
 	}
 
 	// Clean up SmartBFT sequence tracking
@@ -1617,9 +1869,23 @@ func (v *View) handlePhaseQuorumReached(sequence uint64, phase string) {
 
 	switch phase {
 	case "preprep":
-		v.startPreparePhaseWithShardLeaders(sequence)
+		if v.config.Role == RolePrimaryLeader {
+			v.startPreparePhaseWithShardLeaders(sequence)
+		} else {
+			v.logger.Info("PrePrep phase quorum reached - Non-primary node, not starting prepare phase",
+				"sequence", sequence,
+				"role", v.config.Role.String(),
+				"nodeID", v.config.NodeID)
+		}
 	case "prepare":
-		v.startCommitPhaseWithShardLeaders(sequence)
+		if v.config.Role == RolePrimaryLeader {
+			v.startCommitPhaseWithShardLeaders(sequence)
+		} else {
+			v.logger.Info("Prepare phase quorum reached - Non-primary node, not starting commit phase",
+				"sequence", sequence,
+				"role", v.config.Role.String(),
+				"nodeID", v.config.NodeID)
+		}
 	case "commit":
 		// Get the proposal from the most reliable source
 		var proposal Proposal

@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hyperledger/fabric-chaincode-go/v2/shim"
 	"github.com/hyperledger/fabric-lib-go/bccsp"
@@ -566,16 +567,33 @@ func ChaincodeInvokeOrQuery(
 			}
 
 			// send the envelope for ordering
+			logger.Infof("=== SENDING TRANSACTION TO ORDERER ===")
+			logger.Infof("TxID: %s", txid)
+			logger.Infof("Channel: %s", channelID)
+			logger.Infof("Function: %s", funcName)
+
 			if err = bc.Send(env); err != nil {
+				logger.Errorf("Failed to send transaction to orderer: %v", err)
 				return proposalResp, errors.WithMessagef(err, "error sending transaction for %s", funcName)
 			}
 
+			logger.Infof("Transaction successfully sent to orderer")
+
 			if dg != nil && ctx != nil {
+				logger.Infof("=== WAITING FOR TRANSACTION CONFIRMATION ===")
+				logger.Infof("WaitForEvent enabled: true")
+				logger.Infof("Timeout: %v", waitForEventTimeout)
+
 				// wait for event that contains the txid from all peers
 				err = dg.Wait(ctx)
 				if err != nil {
+					logger.Errorf("Error while waiting for transaction confirmation: %v", err)
 					return nil, err
 				}
+
+				logger.Infof("Transaction confirmation completed successfully")
+			} else {
+				logger.Infof("WaitForEvent disabled - returning immediately without waiting for confirmation")
 			}
 		}
 	}
@@ -646,6 +664,14 @@ func NewDeliverGroup(
 // to timeout. An error will be returned whenever even a single
 // deliver client fails to connect to its peer
 func (dg *DeliverGroup) Connect(ctx context.Context) error {
+	logger.Infof("=== PEER CLI CONNECTING TO DELIVER SERVICE ===")
+	logger.Infof("Connecting to %d peer(s) for txID: %s", len(dg.Clients), dg.TxID)
+	logger.Infof("Channel: %s", dg.ChannelID)
+
+	for i, client := range dg.Clients {
+		logger.Infof("Peer[%d]: %s", i, client.Address)
+	}
+
 	dg.wg.Add(len(dg.Clients))
 	for _, client := range dg.Clients {
 		go dg.ClientConnect(ctx, client)
@@ -656,10 +682,13 @@ func (dg *DeliverGroup) Connect(ctx context.Context) error {
 	select {
 	case <-readyCh:
 		if dg.Error != nil {
+			logger.Errorf("Failed to connect to deliver service: %v", dg.Error)
 			err := errors.WithMessage(dg.Error, "failed to connect to deliver on all peers")
 			return err
 		}
+		logger.Infof("Successfully connected to all peer deliver services")
 	case <-ctx.Done():
+		logger.Errorf("Timeout waiting for connection to deliver service")
 		err := errors.New("timed out waiting for connection to deliver on all peers")
 		return err
 	}
@@ -672,8 +701,14 @@ func (dg *DeliverGroup) Connect(ctx context.Context) error {
 // field upon any error
 func (dg *DeliverGroup) ClientConnect(ctx context.Context, dc *DeliverClient) {
 	defer dg.wg.Done()
+
+	logger.Infof("=== CONNECTING TO PEER DELIVER SERVICE ===")
+	logger.Infof("Peer address: %s", dc.Address)
+	logger.Infof("Channel: %s", dg.ChannelID)
+
 	df, err := dc.Client.DeliverFiltered(ctx)
 	if err != nil {
+		logger.Errorf("Failed to create deliver filtered connection to %s: %v", dc.Address, err)
 		err = errors.WithMessagef(err, "error connecting to deliver filtered at %s", dc.Address)
 		dg.setError(err)
 		return
@@ -681,13 +716,20 @@ func (dg *DeliverGroup) ClientConnect(ctx context.Context, dc *DeliverClient) {
 	defer df.CloseSend()
 	dc.Connection = df
 
+	logger.Infof("Successfully created deliver filtered connection to %s", dc.Address)
+
 	envelope := createDeliverEnvelope(dg.ChannelID, dg.Certificate, dg.Signer)
+	logger.Infof("Sending deliver seek envelope to %s for channel %s", dc.Address, dg.ChannelID)
+
 	err = df.Send(envelope)
 	if err != nil {
+		logger.Errorf("Failed to send deliver seek envelope to %s: %v", dc.Address, err)
 		err = errors.WithMessagef(err, "error sending deliver seek info envelope to %s", dc.Address)
 		dg.setError(err)
 		return
 	}
+
+	logger.Infof("Successfully sent deliver seek envelope to %s", dc.Address)
 }
 
 // Wait waits for all deliver client connections in the group to
@@ -695,11 +737,23 @@ func (dg *DeliverGroup) ClientConnect(ctx context.Context, dc *DeliverClient) {
 // context to timeout
 func (dg *DeliverGroup) Wait(ctx context.Context) error {
 	if len(dg.Clients) == 0 {
+		logger.Infof("No deliver clients to wait for")
 		return nil
 	}
 
+	logger.Infof("=== STARTING TO WAIT FOR TRANSACTION CONFIRMATION ===")
+	logger.Infof("Waiting for txID: %s", dg.TxID)
+	logger.Infof("Channel: %s", dg.ChannelID)
+	logger.Infof("Number of peers to wait for: %d", len(dg.Clients))
+
+	// Log timeout information
+	if deadline, ok := ctx.Deadline(); ok {
+		logger.Infof("Wait timeout: %v", time.Until(deadline))
+	}
+
 	dg.wg.Add(len(dg.Clients))
-	for _, client := range dg.Clients {
+	for i, client := range dg.Clients {
+		logger.Infof("Starting wait goroutine for peer[%d]: %s", i, client.Address)
 		go dg.ClientWait(client)
 	}
 	readyCh := make(chan struct{})
@@ -708,9 +762,15 @@ func (dg *DeliverGroup) Wait(ctx context.Context) error {
 	select {
 	case <-readyCh:
 		if dg.Error != nil {
+			logger.Errorf("Wait completed with error: %v", dg.Error)
 			return dg.Error
 		}
+		logger.Infof("=== TRANSACTION CONFIRMATION RECEIVED ===")
+		logger.Infof("TxID %s successfully confirmed", dg.TxID)
 	case <-ctx.Done():
+		logger.Errorf("=== TIMEOUT WAITING FOR TRANSACTION ===")
+		logger.Errorf("Timed out waiting for txID: %s", dg.TxID)
+		logger.Errorf("This means the transaction was not found in any blocks within the timeout period")
 		err := errors.New("timed out waiting for txid on all peers")
 		return err
 	}
@@ -722,31 +782,70 @@ func (dg *DeliverGroup) Wait(ctx context.Context) error {
 // a block event with the requested txid
 func (dg *DeliverGroup) ClientWait(dc *DeliverClient) {
 	defer dg.wg.Done()
+	logger.Infof("=== PEER CLI WAITING FOR TRANSACTION ===")
+	logger.Infof("Waiting for txID: %s from peer: %s", dg.TxID, dc.Address)
+	logger.Infof("Channel: %s", dg.ChannelID)
+
+	blockCount := 0
 	for {
 		resp, err := dc.Connection.Recv()
 		if err != nil {
+			logger.Errorf("Error receiving from deliver filtered at %s: %v", dc.Address, err)
 			err = errors.WithMessagef(err, "error receiving from deliver filtered at %s", dc.Address)
 			dg.setError(err)
 			return
 		}
+
+		logger.Infof("=== RECEIVED DELIVER RESPONSE ===")
+		logger.Infof("Response type: %T", resp.Type)
+
 		switch r := resp.Type.(type) {
 		case *pb.DeliverResponse_FilteredBlock:
-			filteredTransactions := r.FilteredBlock.FilteredTransactions
-			for _, tx := range filteredTransactions {
+			blockCount++
+			fb := r.FilteredBlock
+			logger.Infof("=== FILTERED BLOCK RECEIVED (Block #%d) ===", blockCount)
+			logger.Infof("Block Number: %d", fb.Number)
+			logger.Infof("Channel ID: %s", fb.ChannelId)
+			logger.Infof("Number of transactions: %d", len(fb.FilteredTransactions))
+
+			// Log all transactions in this block
+			for i, tx := range fb.FilteredTransactions {
+				logger.Infof("Transaction[%d]: TxID=%s, Type=%s, ValidationCode=%s",
+					i, tx.Txid, tx.Type, tx.TxValidationCode)
+
+				// Check if this is our target transaction
 				if tx.Txid == dg.TxID {
-					logger.Infof("txid [%s] committed with status (%s) at %s", dg.TxID, tx.TxValidationCode, dc.Address)
+					logger.Infof("=== FOUND TARGET TRANSACTION ===")
+					logger.Infof("Target TxID: %s", dg.TxID)
+					logger.Infof("Validation Code: %s", tx.TxValidationCode)
+					logger.Infof("Expected Code: %s", pb.TxValidationCode_VALID)
+					logger.Infof("Is Valid: %t", tx.TxValidationCode == pb.TxValidationCode_VALID)
+
 					if tx.TxValidationCode != pb.TxValidationCode_VALID {
+						logger.Errorf("Transaction invalidated with status (%s)", tx.TxValidationCode)
 						err = errors.Errorf("transaction invalidated with status (%s)", tx.TxValidationCode)
 						dg.setError(err)
+					} else {
+						logger.Infof("Transaction successfully validated - peer CLI can proceed")
 					}
 					return
 				}
 			}
+
+			logger.Infof("Target txID %s not found in block %d, continuing to wait...", dg.TxID, fb.Number)
+
 		case *pb.DeliverResponse_Status:
+			logger.Errorf("=== DELIVER STATUS RESPONSE ===")
+			logger.Errorf("Status: %s", r.Status)
+			logger.Errorf("This means delivery completed before finding txID %s", dg.TxID)
 			err = errors.Errorf("deliver completed with status (%s) before txid received", r.Status)
 			dg.setError(err)
 			return
+
 		default:
+			logger.Errorf("=== UNEXPECTED RESPONSE TYPE ===")
+			logger.Errorf("Response type: %T", r)
+			logger.Errorf("Expected: *pb.DeliverResponse_FilteredBlock or *pb.DeliverResponse_Status")
 			err = errors.Errorf("received unexpected response type (%T) from %s", r, dc.Address)
 			dg.setError(err)
 			return
@@ -773,10 +872,16 @@ func createDeliverEnvelope(
 	certificate tls.Certificate,
 	signer identity.SignerSerializer,
 ) *pcommon.Envelope {
+	logger.Infof("=== CREATING DELIVER SEEK ENVELOPE ===")
+	logger.Infof("Channel: %s", channelID)
+
 	var tlsCertHash []byte
 	// check for client certificate and create hash if present
 	if len(certificate.Certificate) > 0 {
 		tlsCertHash = util.ComputeSHA256(certificate.Certificate[0])
+		logger.Infof("TLS certificate hash: %x", tlsCertHash)
+	} else {
+		logger.Infof("No TLS certificate provided")
 	}
 
 	start := &ab.SeekPosition{
@@ -799,6 +904,11 @@ func createDeliverEnvelope(
 		Behavior: ab.SeekInfo_BLOCK_UNTIL_READY,
 	}
 
+	logger.Infof("Seek parameters:")
+	logger.Infof("  Start: NEWEST (will receive blocks from the newest block onwards)")
+	logger.Infof("  Stop: MaxUint64 (will continue indefinitely)")
+	logger.Infof("  Behavior: BLOCK_UNTIL_READY (will wait for new blocks)")
+
 	env, err := protoutil.CreateSignedEnvelopeWithTLSBinding(
 		pcommon.HeaderType_DELIVER_SEEK_INFO,
 		channelID,
@@ -813,5 +923,6 @@ func createDeliverEnvelope(
 		return nil
 	}
 
+	logger.Infof("Successfully created deliver seek envelope")
 	return env
 }

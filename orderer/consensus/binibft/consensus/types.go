@@ -244,7 +244,7 @@ type Logger interface {
 
 // ApplicationDelivery interface for delivering finalized proposals to the application
 type ApplicationDelivery interface {
-	Deliver(proposal Proposal) error
+	Deliver(proposal Proposal, signatures []Signature) error
 }
 
 // Signer interface for signing proposals and messages

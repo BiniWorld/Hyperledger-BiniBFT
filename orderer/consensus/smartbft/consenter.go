@@ -152,7 +152,7 @@ func New(
 		},
 	}
 
-	ab.RegisterClusterNodeServiceServer(srv.Server(), consenter.ClusterService)
+	// Note: ClusterNodeService registration is handled centrally in server/main.go to avoid duplicate registration
 
 	return consenter
 }

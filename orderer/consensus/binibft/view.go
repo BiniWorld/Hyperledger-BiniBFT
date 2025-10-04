@@ -697,14 +697,8 @@ func (v *View) finalizeProposalAndCreateBlock(sequence uint64, proposal BiniBFTP
 	// Mark sequence as finalized
 	v.finalizedSequences[sequence] = true
 
-	// Create signatures (simplified)
-	signatures := []BiniBFTSignature{
-		{
-			ID:    uint64(1), // Simplified
-			Value: v.signMessage(proposal.Payload),
-			Msg:   proposal.Payload,
-		},
-	}
+	// Collect signatures from consensus messages for this sequence
+	signatures := v.collectSignaturesForSequence(sequence, proposal)
 
 	// Deliver to application
 	if v.config.Application != nil {
@@ -713,6 +707,58 @@ func (v *View) finalizeProposalAndCreateBlock(sequence uint64, proposal BiniBFTP
 
 	// Advance sequence
 	v.Sequence++
+}
+
+func (v *View) collectSignaturesForSequence(sequence uint64, proposal BiniBFTProposal) []BiniBFTSignature {
+	var signatures []BiniBFTSignature
+
+	// Helper function to convert NodeID to uint64
+	nodeIDToUint64 := func(nodeID NodeID) uint64 {
+		var id uint64
+		fmt.Sscanf(string(nodeID), "%d", &id)
+		return id
+	}
+
+	// Collect signatures from pre-prepare messages
+	if prePrepMsgs, exists := v.prePrepMessages[sequence]; exists {
+		for nodeID, msg := range prePrepMsgs {
+			if len(msg.Signature) > 0 {
+				signatures = append(signatures, BiniBFTSignature{
+					ID:    nodeIDToUint64(nodeID),
+					Value: msg.Signature,
+					Msg:   proposal.Payload,
+				})
+			}
+		}
+	}
+
+	// Collect signatures from prepare messages
+	if prepareMsgs, exists := v.prepareMessages[sequence]; exists {
+		for nodeID, msg := range prepareMsgs {
+			if len(msg.Signature) > 0 {
+				signatures = append(signatures, BiniBFTSignature{
+					ID:    nodeIDToUint64(nodeID),
+					Value: msg.Signature,
+					Msg:   proposal.Payload,
+				})
+			}
+		}
+	}
+
+	// Collect signatures from commit messages
+	if commitMsgs, exists := v.commitMessages[sequence]; exists {
+		for nodeID, msg := range commitMsgs {
+			if len(msg.Signature) > 0 {
+				signatures = append(signatures, BiniBFTSignature{
+					ID:    nodeIDToUint64(nodeID),
+					Value: msg.Signature,
+					Msg:   proposal.Payload,
+				})
+			}
+		}
+	}
+
+	return signatures
 }
 
 func (v *View) signMessage(data []byte) []byte {

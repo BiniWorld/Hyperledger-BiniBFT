@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -117,11 +118,21 @@ func (hc *Consensus) SubmitRequest(request []byte) error {
 		return fmt.Errorf("consensus not active")
 	}
 
-	hc.config.Logger.Info("Submitting request",
+	hc.config.Logger.Info("Submitting request to consensus",
 		"role", hc.config.Role.String(),
-		"nodeID", hc.config.NodeID)
+		"nodeID", hc.config.NodeID,
+		"requestSize", len(request),
+		"isActive", hc.isActive,
+		"primaryLeader", hc.config.PrimaryLeader)
 
-	return hc.requestPool.Submit(request)
+	err := hc.requestPool.Submit(request)
+	if err != nil {
+		hc.config.Logger.Error("Failed to submit request to pool", "error", err)
+		return err
+	}
+
+	hc.config.Logger.Debug("Request successfully submitted to pool")
+	return nil
 }
 
 // GetStatus returns the current consensus status
@@ -154,7 +165,7 @@ func (hc *Consensus) GetCurrentView() *View {
 // processBatchFromManager processes batches from the batch manager
 func (hc *Consensus) processBatch() {
 	go func() {
-		ticker := time.NewTicker(500 * time.Millisecond) // Add a reasonable delay between batch checks
+		ticker := time.NewTicker(10 * time.Millisecond) // Very fast batch processing for immediate response
 		defer ticker.Stop()
 
 		for {
@@ -170,6 +181,7 @@ func (hc *Consensus) processBatch() {
 
 func (c *Consensus) propose() {
 	if c.Batcher.Closed() {
+		c.config.Logger.Debug("Batcher is closed, skipping propose")
 		return
 	}
 
@@ -185,13 +197,24 @@ func (c *Consensus) propose() {
 		return
 	}
 
+	c.config.Logger.Info("Processing batch",
+		"batchSize", len(nextBatch),
+		"sequence", c.currentViewObj.Sequence)
+
 	// Get fresh metadata to ensure we have the latest sequence
 	metadata := c.currentViewObj.GetMetadata()
 	proposal := c.config.Assembler.AssembleProposal(metadata, nextBatch)
 
 	// Try to propose - the view will handle sequence validation
 	if err := c.currentViewObj.Propose(proposal); err != nil {
-		c.config.Logger.Debug("Failed to propose", "error", err)
+		c.config.Logger.Error("Failed to propose batch",
+			"error", err,
+			"batchSize", len(nextBatch),
+			"sequence", c.currentViewObj.Sequence)
+	} else {
+		c.config.Logger.Info("Successfully proposed batch",
+			"batchSize", len(nextBatch),
+			"sequence", c.currentViewObj.Sequence)
 	}
 }
 
@@ -200,198 +223,155 @@ func (hc *Consensus) HandleMessage(from NodeID, message Message) error {
 	switch message.Type {
 	case MsgRequest:
 		var requestMsg RequestMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &requestMsg); err == nil {
-				hc.config.Logger.Info("Received MsgRequest, processing directly", "from", from)
-				hc.handleRequest(requestMsg.Request.Data)
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal request payload", "error", err, "from", from)
-			}
-		} else {
-			hc.config.Logger.Error("Failed to marshal request payload", "error", err, "from", from)
+		if err := json.Unmarshal(message.Payload.([]byte), &requestMsg); err == nil {
+			hc.config.Logger.Info("Received MsgRequest, processing directly", "from", from)
+			hc.handleRequest(requestMsg.Request.Data)
 		}
 	case MsgPrePrep:
 		var prePrepMsg PrePrepMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &prePrepMsg); err == nil {
-				hc.config.Logger.Debug("Received pre-prep message", "sequence", prePrepMsg.Sequence, "from", message.From)
-				// Use view for view-based consensus only
-				if hc.currentViewObj != nil {
-					if err := hc.currentViewObj.HandlePrePrepare(&prePrepMsg); err != nil {
-						hc.config.Logger.Error("Failed to handle pre-prepare in view", "error", err)
-					}
+		if err := json.Unmarshal(message.Payload.([]byte), &prePrepMsg); err == nil {
+			hc.config.Logger.Debug("Received pre-prep message", "sequence", prePrepMsg.Sequence, "from", message.From)
+			// Use view for view-based consensus only
+			if hc.currentViewObj != nil {
+				if err := hc.currentViewObj.HandlePrePrepare(&prePrepMsg); err != nil {
+					hc.config.Logger.Error("Failed to handle pre-prepare in view", "error", err)
 				}
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal pre-prep payload", "error", err)
 			}
 		}
 	case MsgPreparePhase:
 		var prepareMsg PreparePhaseMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &prepareMsg); err == nil {
-				hc.config.Logger.Debug("Received prepare phase message", "sequence", prepareMsg.Sequence, "from", message.From)
-				// Use view for view-based consensus only
-				if hc.currentViewObj != nil {
-					if err := hc.currentViewObj.HandlePreparePhase(&prepareMsg); err != nil {
-						hc.config.Logger.Error("Failed to handle prepare phase in view", "error", err)
-					}
+		if err := json.Unmarshal(message.Payload.([]byte), &prepareMsg); err == nil {
+			hc.config.Logger.Debug("Received prepare phase message", "sequence", prepareMsg.Sequence, "from", message.From)
+			// Use view for view-based consensus only
+			if hc.currentViewObj != nil {
+				if err := hc.currentViewObj.HandlePreparePhase(&prepareMsg); err != nil {
+					hc.config.Logger.Error("Failed to handle prepare phase in view", "error", err)
 				}
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal prepare phase payload", "error", err)
 			}
 		}
 	case MsgPrepare:
 		var prepareMsg PrepareMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &prepareMsg); err == nil {
-				hc.config.Logger.Debug("Received prepare message", "sequence", prepareMsg.Sequence, "from", message.From)
-				// Use view for view-based consensus
-				if hc.currentViewObj != nil {
-					if err := hc.currentViewObj.HandlePreparePhase(&PreparePhaseMessage{
-						Proposal: prepareMsg.Proposal,
-						View:     prepareMsg.View,
-						Sequence: prepareMsg.Sequence,
-						// Digest:    prepareMsg.Digest,
-						NodeID:    prepareMsg.NodeID,
-						ShardID:   hc.config.ShardID,
-						Signature: prepareMsg.Signature,
-					}); err != nil {
-						hc.config.Logger.Error("Failed to handle prepare in view", "error", err)
-					}
+		if err := json.Unmarshal(message.Payload.([]byte), &prepareMsg); err == nil {
+			hc.config.Logger.Debug("Received prepare message", "sequence", prepareMsg.Sequence, "from", message.From)
+			// Use view for view-based consensus
+			if hc.currentViewObj != nil {
+				if err := hc.currentViewObj.HandlePreparePhase(&PreparePhaseMessage{
+					Proposal: prepareMsg.Proposal,
+					View:     prepareMsg.View,
+					Sequence: prepareMsg.Sequence,
+					// Digest:    prepareMsg.Digest,
+					NodeID:    prepareMsg.NodeID,
+					ShardID:   hc.config.ShardID,
+					Signature: prepareMsg.Signature,
+				}); err != nil {
+					hc.config.Logger.Error("Failed to handle prepare in view", "error", err)
 				}
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal prepare payload", "error", err)
 			}
 		}
 	case MsgCommitRequest:
 		var commitMsg CommitRequestMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &commitMsg); err == nil {
-				hc.config.Logger.Debug("Received commit request message", "sequence", commitMsg.Sequence, "from", message.From)
-				// Use view for view-based consensus only
-				if hc.currentViewObj != nil {
-					if err := hc.currentViewObj.HandleCommitRequest(&commitMsg); err != nil {
-						hc.config.Logger.Error("Failed to handle commit request in view", "error", err)
-					}
+		if err := json.Unmarshal(message.Payload.([]byte), &commitMsg); err == nil {
+			hc.config.Logger.Debug("Received commit request message", "sequence", commitMsg.Sequence, "from", message.From)
+			// Use view for view-based consensus only
+			if hc.currentViewObj != nil {
+				if err := hc.currentViewObj.HandleCommitRequest(&commitMsg); err != nil {
+					hc.config.Logger.Error("Failed to handle commit request in view", "error", err)
 				}
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal commit request payload", "error", err)
 			}
 		}
 	case MsgCommitPhase:
 		var commitMsg CommitMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &commitMsg); err == nil {
-				hc.config.Logger.Debug("Received commit message", "proposalID", commitMsg.ProposalID, "from", message.From)
-				// Use view for view-based consensus
-				if hc.currentViewObj != nil {
-					// Convert CommitMessage to CommitRequestMessage for view handling
-					// Create empty proposal for now - in real implementation this should come from the message
-					emptyProposal := Proposal{
-						Payload: []byte(commitMsg.ProposalID),
-					}
-					commitReqMsg := &CommitRequestMessage{
-						Proposal: emptyProposal,
-						View:     0, // Will be set by view
-						Sequence: 0, // Will be set by view
-						// Digest:    []byte(commitMsg.ProposalID), // Simple digest
-						NodeID:    message.From,
-						ShardID:   hc.config.ShardID,
-						Signature: []byte("commit-sig"), // Simple signature
-					}
-					if err := hc.currentViewObj.HandleCommitRequest(commitReqMsg); err != nil {
-						hc.config.Logger.Error("Failed to handle commit in view", "error", err)
-					}
+		if err := json.Unmarshal(message.Payload.([]byte), &commitMsg); err == nil {
+			hc.config.Logger.Debug("Received commit message", "proposalID", commitMsg.ProposalID, "from", message.From)
+			// Use view for view-based consensus
+			if hc.currentViewObj != nil {
+				// Convert CommitMessage to CommitRequestMessage for view handling
+				// Create empty proposal for now - in real implementation this should come from the message
+				emptyProposal := Proposal{
+					Payload: []byte(commitMsg.ProposalID),
 				}
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal commit payload", "error", err)
+				// Create proper digest from proposal
+				var digest []byte
+				if len(commitMsg.ProposalID) > 0 {
+					digest = []byte(commitMsg.ProposalID)
+				} else if emptyProposal.Payload != nil {
+					hash := sha256.Sum256(emptyProposal.Payload)
+					digest = hash[:]
+				}
+
+				// Create proper signature
+				var signature []byte
+				if hc.config.Signer != nil {
+					signature = hc.config.Signer.Sign(digest)
+				}
+
+				commitReqMsg := &CommitRequestMessage{
+					Proposal:  emptyProposal,
+					View:      0, // Will be set by view
+					Sequence:  0, // Will be set by view
+					Digest:    string(digest),
+					NodeID:    message.From,
+					ShardID:   hc.config.ShardID,
+					Signature: signature,
+				}
+				if err := hc.currentViewObj.HandleCommitRequest(commitReqMsg); err != nil {
+					hc.config.Logger.Error("Failed to handle commit in view", "error", err)
+				}
 			}
 		}
 	case MsgViewChange:
 		var vcReq ViewChangeRequest
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &vcReq); err == nil {
-				hc.config.Logger.Debug("Received view change request", "newView", vcReq.NewView, "from", message.From)
-				// View change handling would go here
-				hc.config.Logger.Info("View change request received but not implemented", "newView", vcReq.NewView)
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal view change payload", "error", err)
-			}
+		if err := json.Unmarshal(message.Payload.([]byte), &vcReq); err == nil {
+			hc.config.Logger.Debug("Received view change request", "newView", vcReq.NewView, "from", message.From)
+			// View change handling would go here
+			hc.config.Logger.Info("View change request received but not implemented", "newView", vcReq.NewView)
 		}
 
 	case MsgCrossShardRequest:
 		// Handle JSON payload deserialization for cross-shard requests
 		var crossShardMsg CrossShardRequestMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &crossShardMsg); err == nil {
-				hc.config.Logger.Info("Received cross-shard request message",
-					"requestID", crossShardMsg.Request.ID,
-					"from", message.From,
-					"nodeID", hc.config.NodeID)
-				hc.handleCrossShardRequest(&crossShardMsg)
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal cross-shard request payload",
-					"from", message.From,
-					"nodeID", hc.config.NodeID,
-					"error", err)
-			}
-		} else {
-			hc.config.Logger.Error("Failed to marshal cross-shard request payload",
+		if err := json.Unmarshal(message.Payload.([]byte), &crossShardMsg); err == nil {
+			hc.config.Logger.Info("Received cross-shard request message",
+				"requestID", crossShardMsg.Request.ID,
 				"from", message.From,
-				"nodeID", hc.config.NodeID,
-				"error", err)
+				"nodeID", hc.config.NodeID)
+			hc.handleCrossShardRequest(&crossShardMsg)
 		}
 	case MsgShardAck:
 		var shardAckMsg ShardAckMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &shardAckMsg); err == nil {
-				hc.config.Logger.Debug("Received shard ack message", "sequence", shardAckMsg.Sequence, "from", message.From)
-				// Use view for view-based consensus only
-				if hc.currentViewObj != nil {
-					if err := hc.currentViewObj.HandleShardAck(&shardAckMsg); err != nil {
-						hc.config.Logger.Error("Failed to handle shard ack in view", "error", err)
-					}
+		if err := json.Unmarshal(message.Payload.([]byte), &shardAckMsg); err == nil {
+			hc.config.Logger.Debug("Received shard ack message", "sequence", shardAckMsg.Sequence, "from", message.From)
+			// Use view for view-based consensus only
+			if hc.currentViewObj != nil {
+				if err := hc.currentViewObj.HandleShardAck(&shardAckMsg); err != nil {
+					hc.config.Logger.Error("Failed to handle shard ack in view", "error", err)
 				}
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal shard ack payload", "error", err)
 			}
 		}
 	case MsgFinalizedBlock:
 		var finalizedBlockMsg FinalizedBlockMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &finalizedBlockMsg); err == nil {
-				hc.config.Logger.Debug("Received finalized block message", "sequence", finalizedBlockMsg.Sequence, "from", message.From)
-				hc.handleFinalizedBlock(&finalizedBlockMsg)
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal finalized block payload", "error", err)
-			}
+		if err := json.Unmarshal(message.Payload.([]byte), &finalizedBlockMsg); err == nil {
+			hc.config.Logger.Debug("Received finalized block message", "sequence", finalizedBlockMsg.Sequence, "from", message.From)
+			hc.handleFinalizedBlock(&finalizedBlockMsg)
 		}
 	case MsgIntraShardVote:
 		var intraShardVoteMsg IntraShardVoteMessage
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &intraShardVoteMsg); err == nil {
-				hc.config.Logger.Debug("Received intra-shard vote message", "sequence", intraShardVoteMsg.Sequence, "phase", intraShardVoteMsg.Phase, "from", message.From)
-				if hc.currentViewObj != nil {
-					if err := hc.currentViewObj.HandleIntraShardVote(&intraShardVoteMsg); err != nil {
-						hc.config.Logger.Error("Failed to handle intra-shard vote in view", "error", err)
-					}
+		if err := json.Unmarshal(message.Payload.([]byte), &intraShardVoteMsg); err == nil {
+			hc.config.Logger.Debug("Received intra-shard vote message", "sequence", intraShardVoteMsg.Sequence, "phase", intraShardVoteMsg.Phase, "from", message.From)
+			if hc.currentViewObj != nil {
+				if err := hc.currentViewObj.HandleIntraShardVote(&intraShardVoteMsg); err != nil {
+					hc.config.Logger.Error("Failed to handle intra-shard vote in view", "error", err)
 				}
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal intra-shard vote payload", "error", err)
 			}
 		}
 	case MsgIntraShardVoteResponse:
 		var intraShardVoteResponse IntraShardVoteResponse
-		if payloadBytes, err := json.Marshal(message.Payload); err == nil {
-			if err := json.Unmarshal(payloadBytes, &intraShardVoteResponse); err == nil {
-				hc.config.Logger.Debug("Received intra-shard vote response", "sequence", intraShardVoteResponse.Sequence, "phase", intraShardVoteResponse.Phase, "from", message.From)
-				if hc.currentViewObj != nil {
-					if err := hc.currentViewObj.HandleIntraShardVoteResponse(&intraShardVoteResponse); err != nil {
-						hc.config.Logger.Error("Failed to handle intra-shard vote response in view", "error", err)
-					}
+		if err := json.Unmarshal(message.Payload.([]byte), &intraShardVoteResponse); err == nil {
+			hc.config.Logger.Debug("Received intra-shard vote response", "sequence", intraShardVoteResponse.Sequence, "phase", intraShardVoteResponse.Phase, "from", message.From)
+			if hc.currentViewObj != nil {
+				if err := hc.currentViewObj.HandleIntraShardVoteResponse(&intraShardVoteResponse); err != nil {
+					hc.config.Logger.Error("Failed to handle intra-shard vote response in view", "error", err)
 				}
-			} else {
-				hc.config.Logger.Error("Failed to unmarshal intra-shard vote response payload", "error", err)
 			}
 		}
 	}
@@ -483,6 +463,62 @@ func (hc *Consensus) handleCrossShardRequest(crossShardMsg *CrossShardRequestMes
 		"nodeRole", hc.config.Role.String())
 }
 
+// collectSignaturesFromFinalized collects signatures from a finalized block message
+func (hc *Consensus) collectSignaturesFromFinalized(finalizedMsg *FinalizedBlockMessage) []Signature {
+	var signatures []Signature
+
+	// Collect signatures from all nodes that participated in consensus
+	// This should include signatures from the finalized message's vote set
+	if finalizedMsg.Signatures != nil {
+		signatures = append(signatures, finalizedMsg.Signatures...)
+	}
+
+	// If no signatures in finalized message, collect from consensus participants
+	if len(signatures) == 0 && hc.config.Signer != nil {
+		// Create signature from current node as fallback
+		digest := sha256.Sum256(finalizedMsg.Proposal.Payload)
+		sig := hc.config.Signer.Sign(digest[:])
+
+		nodeIDUint64 := hc.nodeIDToUint64(hc.config.NodeID)
+
+		signatures = append(signatures, Signature{
+			ID:    nodeIDUint64,
+			Value: sig,
+			Msg:   digest[:],
+		})
+
+		// TODO: Collect signatures from other consensus participants
+		// This requires implementing proper BFT signature aggregation
+		hc.config.Logger.Info("BiniBFT: Only single signature available - peer validation may fail")
+	}
+
+	hc.config.Logger.Info("Collected signatures for block delivery",
+		"count", len(signatures),
+		"signers", func() []uint64 {
+			var signers []uint64
+			for _, sig := range signatures {
+				signers = append(signers, sig.ID)
+			}
+			return signers
+		}())
+
+	return signatures
+}
+
+// nodeIDToUint64 converts NodeID string to uint64 (same approach as SmartBFT)
+func (hc *Consensus) nodeIDToUint64(nodeID NodeID) uint64 {
+	// Try to parse as numeric first
+	if id, err := strconv.ParseUint(string(nodeID), 10, 64); err == nil {
+		return id
+	}
+
+	// Fallback to hash-based conversion
+	hash := sha256.Sum256([]byte(nodeID))
+	// Use first 8 bytes of hash as uint64
+	return uint64(hash[0])<<56 | uint64(hash[1])<<48 | uint64(hash[2])<<40 | uint64(hash[3])<<32 |
+		uint64(hash[4])<<24 | uint64(hash[5])<<16 | uint64(hash[6])<<8 | uint64(hash[7])
+}
+
 // handleFinalizedBlock processes finalized block messages from shard leaders
 func (hc *Consensus) handleFinalizedBlock(finalizedMsg *FinalizedBlockMessage) {
 	hc.config.Logger.Info("Handling finalized block from shard leader",
@@ -493,7 +529,9 @@ func (hc *Consensus) handleFinalizedBlock(finalizedMsg *FinalizedBlockMessage) {
 
 	// Deliver the finalized proposal to the application
 	if hc.config.Application != nil {
-		if err := hc.config.Application.Deliver(finalizedMsg.Proposal); err != nil {
+		// Collect signatures from the finalized message
+		signatures := hc.collectSignaturesFromFinalized(finalizedMsg)
+		if err := hc.config.Application.Deliver(finalizedMsg.Proposal, signatures); err != nil {
 			hc.config.Logger.Error("Failed to deliver finalized block to application",
 				"error", err,
 				"sequence", finalizedMsg.Sequence)

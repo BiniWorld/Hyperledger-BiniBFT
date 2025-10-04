@@ -7,9 +7,20 @@ SPDX-License-Identifier: Apache-2.0
 package binibft
 
 import (
+	"crypto/sha256"
 	"encoding/asn1"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	sync "sync"
 	"time"
+
+	"github.com/hyperledger/fabric-lib-go/bccsp"
+	"github.com/hyperledger/fabric-lib-go/common/flogging"
+	cb "github.com/hyperledger/fabric-protos-go-apiv2/common"
+	"github.com/hyperledger/fabric/orderer/common/cluster"
+	"github.com/hyperledger/fabric/orderer/common/localconfig"
+	"github.com/hyperledger/fabric/orderer/consensus"
 )
 
 // WALConfig consensus specific configuration parameters from orderer.yaml
@@ -48,17 +59,23 @@ type NodeID string
 type ShardID uint32
 
 // BiniBFTProposal represents a consensus proposal in BiniBFT
+// This structure is identical to SmartBFT's types.Proposal for compatibility
 type BiniBFTProposal struct {
 	Payload              []byte
 	Header               []byte
 	Metadata             []byte
-	VerificationSequence int64
+	VerificationSequence int64 // int64 for asn1 marshaling
 }
 
 func (p BiniBFTProposal) Digest() string {
-	rawBytes, err := asn1.Marshal(p)
+	rawBytes, err := asn1.Marshal(BiniBFTProposal{
+		VerificationSequence: p.VerificationSequence,
+		Metadata:             p.Metadata,
+		Payload:              p.Payload,
+		Header:               p.Header,
+	})
 	if err != nil {
-		panic(err)
+		panic(fmt.Sprintf("failed marshaling proposal: %v", err))
 	}
 	return computeDigest(rawBytes)
 }
@@ -320,8 +337,143 @@ func parseDuration(durationStr string) time.Duration {
 	return duration
 }
 
-// computeDigest computes a digest for the given data
+// computeDigest computes a digest for the given data using SHA256
 func computeDigest(data []byte) string {
-	// Simple digest implementation - in production use proper cryptographic hash
-	return string(data)
+	h := sha256.New()
+	h.Write(data)
+	digest := h.Sum(nil)
+	return hex.EncodeToString(digest)
+}
+
+// BiniBFTSyncResponse represents the response from a synchronization operation
+type BiniBFTSyncResponse struct {
+	Latest   BiniBFTDecision
+	Reconfig BiniBFTReconfigSync
+}
+
+// BiniBFTReconfigSync represents reconfiguration information during sync
+type BiniBFTReconfigSync struct {
+	InReplicatedDecisions bool
+	CurrentNodes          []uint64
+	CurrentConfig         *Configuration
+}
+
+// SyncBuffer is a buffer for synchronizing blocks during BFT sync
+type SyncBuffer struct {
+	blocks   map[uint64]*cb.Block
+	capacity uint
+	stopped  bool
+	mutex    sync.Mutex
+	cond     *sync.Cond
+}
+
+// NewSyncBuffer creates a new sync buffer with the given capacity
+func NewSyncBuffer(capacity uint) *SyncBuffer {
+	sb := &SyncBuffer{
+		blocks:   make(map[uint64]*cb.Block),
+		capacity: capacity,
+	}
+	sb.cond = sync.NewCond(&sb.mutex)
+	return sb
+}
+
+// PullBlock pulls a block from the buffer at the given sequence number
+func (sb *SyncBuffer) PullBlock(seq uint64) *cb.Block {
+	sb.mutex.Lock()
+	defer sb.mutex.Unlock()
+
+	for {
+		if sb.stopped {
+			return nil
+		}
+		if block, exists := sb.blocks[seq]; exists {
+			delete(sb.blocks, seq)
+			return block
+		}
+		sb.cond.Wait()
+	}
+}
+
+// HandleBlock handles a received block by adding it to the buffer
+func (sb *SyncBuffer) HandleBlock(channelID string, block *cb.Block) error {
+	sb.mutex.Lock()
+	defer sb.mutex.Unlock()
+
+	if sb.stopped {
+		return fmt.Errorf("sync buffer is stopped")
+	}
+
+	if uint(len(sb.blocks)) >= sb.capacity {
+		return fmt.Errorf("sync buffer is full")
+	}
+
+	sb.blocks[block.Header.Number] = block
+	sb.cond.Broadcast()
+	return nil
+}
+
+// Stop stops the sync buffer
+func (sb *SyncBuffer) Stop() {
+	sb.mutex.Lock()
+	defer sb.mutex.Unlock()
+
+	sb.stopped = true
+	sb.cond.Broadcast()
+}
+
+// BiniBFTSynchronizerInterface interface for synchronizing with other nodes
+type BiniBFTSynchronizerInterface interface {
+	Sync() BiniBFTSyncResponse
+}
+
+// BiniBFTSimpleSynchronizer is a simple synchronizer that doesn't use BFT delivery
+type BiniBFTSimpleSynchronizer struct {
+	lastReconfig       BiniBFTReconfig
+	selfID             uint64
+	LatestConfig       func() (*Configuration, []uint64)
+	BlockToDecision    func(*cb.Block) *BiniBFTDecision
+	OnCommit           func(*cb.Block) BiniBFTReconfig
+	Support            consensus.ConsenterSupport
+	CryptoProvider     bccsp.BCCSP
+	ClusterDialer      *cluster.PredicateDialer
+	LocalConfigCluster localconfig.Cluster
+	BlockPullerFactory BlockPullerFactory
+	Logger             *flogging.FabricLogger
+}
+
+func (s *BiniBFTSimpleSynchronizer) Sync() BiniBFTSyncResponse {
+	s.Logger.Debug("BiniBFT Simple Sync initiated")
+	// Simple synchronizer just returns current state from ledger
+	block := s.Support.Block(s.Support.Height() - 1)
+	config, nodes := s.LatestConfig()
+	return BiniBFTSyncResponse{
+		Latest: *s.BlockToDecision(block),
+		Reconfig: BiniBFTReconfigSync{
+			InReplicatedDecisions: false,
+			CurrentNodes:          nodes,
+			CurrentConfig:         config,
+		},
+	}
+}
+
+// BiniBFTMetadata represents metadata for BiniBFT consensus
+type BiniBFTMetadata struct {
+	ViewId         uint64 `protobuf:"varint,1,opt,name=view_id,json=viewId,proto3" json:"view_id,omitempty"`
+	LatestSequence uint64 `protobuf:"varint,2,opt,name=latest_sequence,json=latestSequence,proto3" json:"latest_sequence,omitempty"`
+}
+
+// GetViewId returns the view ID
+func (m *BiniBFTMetadata) GetViewId() uint64 {
+	if m != nil {
+		return m.ViewId
+	}
+	return 0
+}
+
+// GetLatestSequence returns the latest sequence
+func (m *BiniBFTMetadata) GetLatestSequence() uint64 {
+	if m != nil {
+		return m.LatestSequence
+	}
+	return 0
 }

@@ -143,16 +143,18 @@ type ShardAckMessage struct {
 	NodeID       NodeID
 	Acknowledged bool
 	Phase        string // "preprep", "prepare", "commit"
+	Signature    []byte // Signature from the shard leader
 	Timestamp    time.Time
 }
 
 // FinalizedBlockMessage for forwarding finalized blocks to followers
 type FinalizedBlockMessage struct {
-	Sequence  uint64
-	Proposal  Proposal
-	ShardID   ShardID
-	LeaderID  NodeID
-	Timestamp time.Time
+	Sequence   uint64
+	Proposal   Proposal
+	ShardID    ShardID
+	LeaderID   NodeID
+	Timestamp  time.Time
+	Signatures []Signature // Signatures from consensus participants
 }
 
 // IntraShardVoteMessage for requesting votes within a shard

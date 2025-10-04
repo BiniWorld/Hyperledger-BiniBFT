@@ -8,6 +8,8 @@ package binibft
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/asn1"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,7 @@ import (
 	"github.com/hyperledger/fabric-lib-go/bccsp"
 	"github.com/hyperledger/fabric-lib-go/common/flogging"
 	cb "github.com/hyperledger/fabric-protos-go-apiv2/common"
+	"github.com/hyperledger/fabric-protos-go-apiv2/msp"
 	"github.com/hyperledger/fabric/common/policies"
 	"github.com/hyperledger/fabric/orderer/common/cluster"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
@@ -37,7 +40,7 @@ type BFTChain struct {
 	clusterDialer      *cluster.PredicateDialer
 	localConfigCluster localconfig.Cluster
 	Comm               cluster.Communicator
-	SignerSerializer   SignerSerializer
+	SignerSerializer   consensus.ConsenterSupport
 	PolicyManager      policies.Manager
 	Logger             *flogging.FabricLogger
 	WALDir             string
@@ -59,6 +62,9 @@ type BFTChain struct {
 	primaryLeader NodeID
 	shardLeaders  map[ShardID]NodeID
 	shardNodes    map[ShardID][]NodeID
+
+	// Synchronizer for BFT block delivery
+	synchronizer BiniBFTSynchronizerInterface
 }
 
 // NewChain creates new BiniBFT chain
@@ -70,13 +76,15 @@ func NewChain(
 	clusterDialer *cluster.PredicateDialer,
 	localConfigCluster localconfig.Cluster,
 	comm cluster.Communicator,
-	signerSerializer SignerSerializer,
+	signerSerializer consensus.ConsenterSupport, // Use ConsenterSupport which includes SignerSerializer with correct OrdererMSP identity
 	policyManager policies.Manager,
 	support consensus.ConsenterSupport,
 	metrics *Metrics,
 	bccsp bccsp.BCCSP,
 ) (*BFTChain, error) {
 	logger := flogging.MustGetLogger("orderer.consensus.binibft.chain").With(zap.String("channel", support.ChannelID()))
+
+	logger.Infof("*** BINIBFT CHAIN CREATED *** - Channel: %s, SelfID: %d", support.ChannelID(), selfID)
 
 	c := &BFTChain{
 		RuntimeConfig:      &atomic.Value{},
@@ -125,8 +133,28 @@ func NewChain(
 
 	c.RuntimeConfig.Store(rtc)
 
-	c.verifier = buildVerifier(cv, c.RuntimeConfig, support, policyManager)
+	requestInspector := &RequestInspector{
+		ValidateIdentityStructure: func(_ *msp.SerializedIdentity) error {
+			return nil
+		},
+		Logger: logger,
+	}
+	c.verifier = buildVerifier(cv, c.RuntimeConfig, support, requestInspector, policyManager)
 	c.consensus = c.buildBiniBFTConsensus()
+
+	// Create BFT synchronizer for block delivery
+	synchronizerFactory := NewSynchronizerFactory()
+	c.synchronizer = synchronizerFactory.CreateSynchronizer(
+		logger,
+		localConfigCluster,
+		rtc,
+		c.BlockToDecision,
+		c.OnCommit,
+		c.updateRuntimeConfig,
+		support,
+		bccsp,
+		clusterDialer,
+	)
 
 	// Setup communication with list of remote nodes for the new channel
 	c.Comm.Configure(c.support.ChannelID(), rtc.RemoteNodes)
@@ -180,6 +208,12 @@ func (c *BFTChain) buildBiniBFTConsensus() *BiniBFTConsensus {
 			ID:               c.Config.SelfID,
 			Logger:           flogging.MustGetLogger("orderer.consensus.binibft.signer").With(channelDecorator),
 			SignerSerializer: c.SignerSerializer,
+			LastConfigBlockNum: func(block *cb.Block) uint64 {
+				if protoutil.IsConfigBlock(block) {
+					return block.Header.Number
+				}
+				return c.RuntimeConfig.Load().(RuntimeConfig).LastConfigBlock.Header.Number
+			},
 		},
 		Application: c,
 		Assembler:   c.assembler,
@@ -212,15 +246,28 @@ func (c *BFTChain) buildBiniBFTConsensus() *BiniBFTConsensus {
 
 // Order accepts a message which has been processed at a given configSeq
 func (c *BFTChain) Order(env *cb.Envelope, configSeq uint64) error {
+	c.Logger.Infof("=== BINIBFT ORDER METHOD CALLED ===")
+	c.Logger.Infof("ConfigSeq: %d", configSeq)
+
 	seq := c.support.Sequence()
+	c.Logger.Infof("Current sequence: %d", seq)
+
 	if configSeq < seq {
 		c.Logger.Warnf("Normal message was validated against %d, although current config seq has advanced (%d)", configSeq, seq)
 		if _, err := c.support.ProcessNormalMsg(env); err != nil {
+			c.Logger.Errorf("Failed to process normal message: %v", err)
 			return errors.Errorf("bad normal message: %s", err)
 		}
 	}
 
-	return c.submit(env)
+	c.Logger.Infof("Submitting envelope to BiniBFT consensus")
+	err := c.submit(env)
+	if err != nil {
+		c.Logger.Errorf("Failed to submit envelope: %v", err)
+	} else {
+		c.Logger.Infof("Successfully submitted envelope to BiniBFT consensus")
+	}
+	return err
 }
 
 // Configure accepts a message which reconfigures the channel
@@ -242,23 +289,41 @@ func (c *BFTChain) Configure(config *cb.Envelope, configSeq uint64) error {
 
 // submit submits a request to the BiniBFT consensus
 func (c *BFTChain) submit(env *cb.Envelope) error {
+	c.Logger.Infof("=== BINIBFT SUBMIT METHOD CALLED ===")
+
 	if env == nil {
+		c.Logger.Errorf("Envelope is nil")
 		return errors.New("failed to marshal request envelope: proto: Marshal called with nil")
 	}
+
 	reqBytes, err := proto.Marshal(env)
 	if err != nil {
+		c.Logger.Errorf("Failed to marshal envelope: %v", err)
 		return errors.Wrapf(err, "failed to marshal request envelope")
 	}
 
-	c.Logger.Debugf("BiniBFT.SubmitRequest, node id %d", c.Config.SelfID)
+	c.Logger.Infof("Envelope marshaled successfully, size: %d bytes", len(reqBytes))
+	c.Logger.Infof("BiniBFT.SubmitRequest, node id %d", c.Config.SelfID)
+
+	if c.consensus == nil {
+		c.Logger.Errorf("Consensus is nil - this is the problem!")
+		return errors.New("consensus not initialized")
+	}
+
+	c.Logger.Infof("Calling consensus.SubmitRequest...")
 	if err = c.consensus.SubmitRequest(reqBytes); err != nil {
+		c.Logger.Errorf("Failed to submit request to consensus: %v", err)
 		return errors.Wrapf(err, "failed to submit request")
 	}
+
+	c.Logger.Infof("Successfully submitted request to BiniBFT consensus")
 	return nil
 }
 
 // Deliver delivers proposal, writes block with transactions and metadata
 func (c *BFTChain) Deliver(proposal BiniBFTProposal, signatures []BiniBFTSignature) BiniBFTReconfig {
+	c.Logger.Infof("*** BINIBFT DELIVER CALLED *** - Block delivery with %d signatures", len(signatures))
+
 	block, err := ProposalToBlock(proposal)
 	if err != nil {
 		c.Logger.Panicf("failed to read proposal, err: %s", err)
@@ -290,10 +355,36 @@ func (c *BFTChain) Deliver(proposal BiniBFTProposal, signatures []BiniBFTSignatu
 		signers = append(signers, s.ID)
 	}
 
-	block.Metadata.Metadata[cb.BlockMetadataIndex_SIGNATURES] = protoutil.MarshalOrPanic(&cb.Metadata{
+	// Ensure metadata array is properly sized
+	if block.Metadata == nil {
+		block.Metadata = &cb.BlockMetadata{}
+	}
+	if len(block.Metadata.Metadata) < int(cb.BlockMetadataIndex_SIGNATURES)+1 {
+		// Initialize metadata array with proper size
+		newMetadata := make([][]byte, int(cb.BlockMetadataIndex_COMMIT_HASH)+1)
+		copy(newMetadata, block.Metadata.Metadata)
+		block.Metadata.Metadata = newMetadata
+	}
+
+	c.Logger.Infof("=== BLOCK METADATA CREATION DEBUG ===")
+	c.Logger.Infof("Creating block metadata with %d signatures", len(sigs))
+	c.Logger.Infof("OrdererBlockMetadata length: %d bytes", len(ordererBlockMetadata))
+	c.Logger.Infof("OrdererBlockMetadata: %x", ordererBlockMetadata)
+
+	for i, sig := range sigs {
+		c.Logger.Infof("Signature %d:", i)
+		c.Logger.Infof("  Signature: %x", sig.Signature)
+		c.Logger.Infof("  IdentifierHeader: %x", sig.IdentifierHeader)
+	}
+
+	blockMetadata := &cb.Metadata{
 		Value:      ordererBlockMetadata,
 		Signatures: sigs,
-	})
+	}
+
+	block.Metadata.Metadata[cb.BlockMetadataIndex_SIGNATURES] = protoutil.MarshalOrPanic(blockMetadata)
+	c.Logger.Infof("Final block metadata[SIGNATURES]: %x", block.Metadata.Metadata[cb.BlockMetadataIndex_SIGNATURES])
+	c.Logger.Infof("=== END BLOCK METADATA CREATION DEBUG ===")
 
 	c.Logger.Infof("Delivering proposal, writing block %d with %d transactions to the ledger with signatures from %v, node id %d",
 		block.Header.Number,
@@ -301,8 +392,85 @@ func (c *BFTChain) Deliver(proposal BiniBFTProposal, signatures []BiniBFTSignatu
 		signers,
 		c.Config.SelfID)
 
+	// Log block header details for comparison
+	c.Logger.Infof("Block %d Header: PreviousHash=%x, DataHash=%x",
+		block.Header.Number,
+		block.Header.PreviousHash,
+		block.Header.DataHash)
+
+	// Log block metadata details
+	if block.Metadata != nil && len(block.Metadata.Metadata) > 0 {
+		c.Logger.Infof("Block %d has %d metadata entries", block.Header.Number, len(block.Metadata.Metadata))
+		for i, metadata := range block.Metadata.Metadata {
+			c.Logger.Debugf("Block %d Metadata[%d]: size=%d bytes", block.Header.Number, i, len(metadata))
+		}
+	} else {
+		c.Logger.Warnf("Block %d has no metadata - this might be the issue!", block.Header.Number)
+	}
+
+	// Log detailed transaction data for comparison with SmartBFT
+	for i, txData := range block.Data.Data {
+		c.Logger.Infof("Block %d Transaction %d: size=%d bytes",
+			block.Header.Number, i, len(txData))
+
+		// Try to parse the transaction to see what type it is
+		if envelope, err := protoutil.UnmarshalEnvelope(txData); err == nil {
+			if payload, err := protoutil.UnmarshalPayload(envelope.Payload); err == nil {
+				if chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader); err == nil {
+					c.Logger.Infof("Block %d Transaction %d: TxID=%s, Type=%s, ChannelID=%s",
+						block.Header.Number, i, chdr.TxId,
+						cb.HeaderType_name[chdr.Type], chdr.ChannelId)
+				}
+			}
+		}
+
+		// Log first 100 bytes of transaction data for debugging
+		if len(txData) > 100 {
+			c.Logger.Debugf("Block %d Transaction %d first 100 bytes: %x",
+				block.Header.Number, i, txData[:100])
+		} else {
+			c.Logger.Debugf("Block %d Transaction %d full data: %x",
+				block.Header.Number, i, txData)
+		}
+	}
+
 	c.Metrics.CommittedBlockNumber.Set(float64(block.Header.Number))
 	c.reportIsLeader()
+
+	// Let Fabric's ledger system set TRANSACTIONS_FILTER automatically (same as SmartBFT)
+	c.Logger.Infof("Letting Fabric set TRANSACTIONS_FILTER automatically for block %d", block.Header.Number)
+
+	// COMPREHENSIVE BLOCK COMPARISON LOGGING FOR BINIBFT vs SMARTBFT
+	c.Logger.Infof("=== BINIBFT BLOCK STRUCTURE COMPARISON ===")
+	c.Logger.Infof("Block Number: %d", block.Header.Number)
+	c.Logger.Infof("Block PreviousHash: %x", block.Header.PreviousHash)
+	c.Logger.Infof("Block DataHash: %x", block.Header.DataHash)
+	c.Logger.Infof("Block Data Transactions: %d", len(block.Data.Data))
+
+	// Log each transaction hash for comparison
+	for i, txData := range block.Data.Data {
+		txHash := sha256.Sum256(txData)
+		c.Logger.Infof("Transaction[%d] Hash: %x, Size: %d bytes", i, txHash[:8], len(txData))
+	}
+
+	// Log metadata structure
+	c.Logger.Infof("Block Metadata Entries: %d", len(block.Metadata.Metadata))
+	for i, metadata := range block.Metadata.Metadata {
+		if len(metadata) > 0 {
+			metadataHash := sha256.Sum256(metadata)
+			c.Logger.Infof("Metadata[%d] Hash: %x, Size: %d bytes", i, metadataHash[:8], len(metadata))
+		} else {
+			c.Logger.Infof("Metadata[%d]: EMPTY", i)
+		}
+	}
+
+	// Log TRANSACTIONS_FILTER specifically
+	if len(block.Metadata.Metadata) > int(cb.BlockMetadataIndex_TRANSACTIONS_FILTER) {
+		txFilter := block.Metadata.Metadata[cb.BlockMetadataIndex_TRANSACTIONS_FILTER]
+		c.Logger.Infof("TRANSACTIONS_FILTER: %v (length: %d)", txFilter, len(txFilter))
+	}
+
+	c.Logger.Infof("=== END BINIBFT BLOCK STRUCTURE ===")
 
 	if protoutil.IsConfigBlock(block) {
 		c.support.WriteConfigBlock(block, nil)
@@ -445,6 +613,7 @@ func buildVerifier(
 	cv ConfigBlockValidator,
 	runtimeConfig *atomic.Value,
 	support consensus.ConsenterSupport,
+	requestInspector *RequestInspector,
 	policyManager policies.Manager,
 ) *Verifier {
 	channelDecorator := zap.String("channel", support.ChannelID())
@@ -453,6 +622,7 @@ func buildVerifier(
 		Channel:               support.ChannelID(),
 		ConfigValidator:       cv,
 		VerificationSequencer: support,
+		ReqInspector:          requestInspector,
 		Logger:                logger,
 		RuntimeConfig:         runtimeConfig,
 		ConsenterVerifier: &consenterVerifier{
@@ -501,7 +671,7 @@ type BiniBFTSignature struct {
 type BiniBFTReconfig struct {
 	InLatestDecision bool
 	CurrentNodes     []uint64
-	CurrentConfig    interface{}
+	CurrentConfig    *Configuration
 }
 
 // BiniBFTRequest represents a request in BiniBFT
@@ -514,19 +684,43 @@ type BiniBFTRequest struct {
 
 // ProposalToBlock converts a BiniBFT proposal to a Fabric block
 func ProposalToBlock(proposal BiniBFTProposal) (*cb.Block, error) {
-	// Simple implementation - in production this would properly decode the proposal
+	// initialize block with empty fields
 	block := &cb.Block{
-		Header: &cb.BlockHeader{
-			Number:       0, // Would be set properly
-			PreviousHash: nil,
-			DataHash:     nil,
-		},
-		Data: &cb.BlockData{
-			Data: [][]byte{proposal.Payload},
-		},
-		Metadata: &cb.BlockMetadata{
-			Metadata: make([][]byte, 4),
-		},
+		Data:     &cb.BlockData{},
+		Metadata: &cb.BlockMetadata{},
+	}
+
+	if len(proposal.Header) == 0 {
+		return nil, errors.New("proposal header cannot be nil")
+	}
+
+	hdr := &asn1Header{}
+
+	if _, err := asn1.Unmarshal(proposal.Header, hdr); err != nil {
+		return nil, errors.Wrap(err, "bad header")
+	}
+
+	block.Header = &cb.BlockHeader{
+		Number:       hdr.Number.Uint64(),
+		PreviousHash: hdr.PreviousHash,
+		DataHash:     hdr.DataHash,
+	}
+
+	if len(proposal.Payload) == 0 {
+		return nil, errors.New("proposal payload cannot be nil")
+	}
+
+	tuple := &ByteBufferTuple{}
+	if err := tuple.FromBytes(proposal.Payload); err != nil {
+		return nil, errors.Wrap(err, "bad payload and metadata tuple")
+	}
+
+	if err := proto.Unmarshal(tuple.A, block.Data); err != nil {
+		return nil, errors.Wrap(err, "bad payload")
+	}
+
+	if err := proto.Unmarshal(tuple.B, block.Metadata); err != nil {
+		return nil, errors.Wrap(err, "bad metadata")
 	}
 	return block, nil
 }
@@ -561,4 +755,69 @@ func LastConfigBlockFromLedgerOrPanic(support consensus.ConsenterSupport, logger
 		logger.Panicf("Failed to retrieve config block from ledger")
 	}
 	return block
+}
+
+// BlockToDecision converts a block to a BiniBFT decision for synchronization
+func (c *BFTChain) BlockToDecision(block *cb.Block) *BiniBFTDecision {
+	decision := &BiniBFTDecision{
+		ProposalID: fmt.Sprintf("block-%d", block.Header.Number),
+		Committed:  true,
+		ShardVotes: make(map[ShardID][]BiniBFTVote),
+		Timestamp:  time.Now(),
+		BatchID:    fmt.Sprintf("batch-%d", block.Header.Number),
+	}
+
+	// Extract shard votes from block metadata if available
+	if block.Header.Number > 0 && len(block.Metadata.Metadata) > int(cb.BlockMetadataIndex_SIGNATURES) {
+		signatureMetadata := &cb.Metadata{}
+		if err := proto.Unmarshal(block.Metadata.Metadata[cb.BlockMetadataIndex_SIGNATURES], signatureMetadata); err == nil {
+			// Extract votes from signatures - each signature represents a vote
+			for _, sigMD := range signatureMetadata.Signatures {
+				idHdr := &cb.IdentifierHeader{}
+				if err := proto.Unmarshal(sigMD.IdentifierHeader, idHdr); err == nil {
+					nodeID := NodeID(fmt.Sprintf("%d", idHdr.Identifier))
+
+					// Determine shard based on node configuration
+					shardID := c.getShardForNode(nodeID)
+
+					vote := BiniBFTVote{
+						ProposalID: decision.ProposalID,
+						NodeID:     nodeID,
+						ShardID:    shardID,
+						Approve:    true, // If signature is present, it's an approval
+						Signature:  sigMD.Signature,
+					}
+
+					decision.ShardVotes[shardID] = append(decision.ShardVotes[shardID], vote)
+				}
+			}
+		}
+	}
+
+	return decision
+}
+
+// getShardForNode determines which shard a node belongs to
+func (c *BFTChain) getShardForNode(nodeID NodeID) ShardID {
+	// Check if node is in any shard
+	for shardID, nodes := range c.shardNodes {
+		for _, node := range nodes {
+			if node == nodeID {
+				return shardID
+			}
+		}
+	}
+	// Default to shard 1 if not found
+	return ShardID(1)
+}
+
+// OnCommit handles block commit events during synchronization
+func (c *BFTChain) OnCommit(block *cb.Block) BiniBFTReconfig {
+	return c.updateRuntimeConfig(block)
+}
+
+// Sync initiates synchronization with other nodes using BFT delivery
+func (c *BFTChain) Sync() BiniBFTSyncResponse {
+	c.Logger.Info("Initiating BiniBFT synchronization")
+	return c.synchronizer.Sync()
 }

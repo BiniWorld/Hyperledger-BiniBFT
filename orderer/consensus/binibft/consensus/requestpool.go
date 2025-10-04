@@ -36,64 +36,71 @@ type requestItem struct {
 
 // RequestPool manages pending requests with enhanced features
 type RequestPool struct {
-	requests      map[string]*Request
-	mu            sync.RWMutex
-	maxSize       uint64
-	timeouts      map[string]*time.Timer
-	logger        Logger
-	closed        bool
-	fifo          *list.List
-	inspector     RequestInspector
-	existMap      map[RequestInfo]*list.Element
-	delMap        map[RequestInfo]struct{}
-	submittedChan chan struct{}
-	sizeBytes     uint64
-	network       NetworkInterface
-	nodeID        NodeID
-	role          NodeRole
-	primaryLeader NodeID
+	requests       map[string]*Request
+	mu             sync.RWMutex
+	maxSize        uint64 // Maximum number of requests in pool
+	maxRequestSize uint64 // Maximum size of individual request in bytes
+	timeouts       map[string]*time.Timer
+	logger         Logger
+	closed         bool
+	fifo           *list.List
+	inspector      RequestInspector
+	existMap       map[RequestInfo]*list.Element
+	delMap         map[RequestInfo]struct{}
+	submittedChan  chan struct{}
+	sizeBytes      uint64
+	network        NetworkInterface
+	nodeID         NodeID
+	role           NodeRole
+	primaryLeader  NodeID
 }
 
 // RequestPoolOptions for configuring the request pool
 type RequestPoolOptions struct {
-	MaxSize       uint64
-	Logger        Logger
-	Inspector     RequestInspector
-	submittedChan chan struct{}
-	Network       NetworkInterface
-	NodeID        NodeID
-	Role          NodeRole
-	PrimaryLeader NodeID
+	MaxSize        uint64 // Maximum number of requests in pool
+	MaxRequestSize uint64 // Maximum size of individual request in bytes
+	Logger         Logger
+	Inspector      RequestInspector
+	submittedChan  chan struct{}
+	Network        NetworkInterface
+	NodeID         NodeID
+	Role           NodeRole
+	PrimaryLeader  NodeID
 }
 
 // NewRequestPool creates a new request pool
 func NewRequestPool() *RequestPool {
 	return NewRequestPoolWithOptions(RequestPoolOptions{
-		MaxSize: 10000, // Default max size
+		MaxSize:        10000,            // Maximum number of requests in pool
+		MaxRequestSize: 50 * 1024 * 1024, // 50MB for chaincode packages
 	})
 }
 
 // NewRequestPoolWithOptions creates a new request pool with options
 func NewRequestPoolWithOptions(opts RequestPoolOptions) *RequestPool {
 	if opts.MaxSize <= 0 {
-		opts.MaxSize = 10000
+		opts.MaxSize = 10000 // Maximum number of requests in pool
+	}
+	if opts.MaxRequestSize <= 0 {
+		opts.MaxRequestSize = 50 * 1024 * 1024 // 50MB for chaincode packages
 	}
 
 	return &RequestPool{
-		requests:      make(map[string]*Request),
-		maxSize:       opts.MaxSize,
-		timeouts:      make(map[string]*time.Timer),
-		logger:        opts.Logger,
-		closed:        false,
-		fifo:          list.New(),
-		inspector:     opts.Inspector,
-		submittedChan: opts.submittedChan,
-		network:       opts.Network,
-		nodeID:        opts.NodeID,
-		role:          opts.Role,
-		primaryLeader: opts.PrimaryLeader,
-		existMap:      make(map[RequestInfo]*list.Element),
-		delMap:        make(map[RequestInfo]struct{}),
+		requests:       make(map[string]*Request),
+		maxSize:        opts.MaxSize,
+		maxRequestSize: opts.MaxRequestSize,
+		timeouts:       make(map[string]*time.Timer),
+		logger:         opts.Logger,
+		closed:         false,
+		fifo:           list.New(),
+		inspector:      opts.Inspector,
+		submittedChan:  opts.submittedChan,
+		network:        opts.Network,
+		nodeID:         opts.NodeID,
+		role:           opts.Role,
+		primaryLeader:  opts.PrimaryLeader,
+		existMap:       make(map[RequestInfo]*list.Element),
+		delMap:         make(map[RequestInfo]struct{}),
 	}
 }
 
@@ -105,11 +112,11 @@ func (rp *RequestPool) Submit(request []byte) error {
 		return errors.Errorf("pool closed, request rejected: %s", reqInfo)
 	}
 
-	if uint64(len(request)) > rp.maxSize {
+	if uint64(len(request)) > rp.maxRequestSize {
 		return fmt.Errorf(
 			"submitted request (%d) is bigger than request max bytes (%d)",
 			len(request),
-			rp.maxSize,
+			rp.maxRequestSize,
 		)
 	}
 
@@ -129,8 +136,8 @@ func (rp *RequestPool) Submit(request []byte) error {
 
 	if uint64(len(rp.requests)) >= rp.maxSize {
 		return fmt.Errorf(
-			"submitted request (%d) is bigger than request max bytes (%d)",
-			len(request),
+			"request pool is full (%d requests), cannot accept more requests (max: %d)",
+			len(rp.requests),
 			rp.maxSize,
 		)
 	}
@@ -157,6 +164,21 @@ func (rp *RequestPool) Submit(request []byte) error {
 	element := rp.fifo.PushBack(reqItem)
 	rp.existMap[reqInfo] = element
 
+	// Log with special attention to large requests (likely chaincode)
+	if uint64(len(request)) > 1024*1024 { // > 1MB
+		rp.logger.Info("Large request added to pool (likely chaincode)",
+			"reqInfo", reqInfo,
+			"requestSize", len(request),
+			"poolSize", len(rp.requests),
+			"role", rp.role.String())
+	} else {
+		rp.logger.Info("Request added to pool",
+			"reqInfo", reqInfo,
+			"requestSize", len(request),
+			"poolSize", len(rp.requests),
+			"role", rp.role.String())
+	}
+
 	// Verify consistency after adding
 	if len(rp.existMap) != rp.fifo.Len() {
 		rp.logger.Error("RequestPool map and list are of different length after adding",
@@ -174,7 +196,9 @@ func (rp *RequestPool) Submit(request []byte) error {
 	// notify that a request was submitted
 	select {
 	case rp.submittedChan <- struct{}{}:
+		rp.logger.Debug("Notified batch builder of new request", "reqInfo", reqInfo)
 	default:
+		rp.logger.Debug("Batch builder notification channel full", "reqInfo", reqInfo)
 	}
 
 	rp.sizeBytes += uint64(len(element.Value.(*requestItem).request))

@@ -3,6 +3,7 @@ package consensus
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -59,6 +60,13 @@ func NewConsensus(config *Config) *Consensus {
 	}
 
 	hc.currentViewObj = NewView(config.NodeID, config.ShardID, config)
+
+	// Log batch configuration for debugging
+	config.Logger.Info("Creating BatchBuilder with configuration",
+		"RequestBatchMaxCount", config.RequestBatchMaxCount,
+		"RequestBatchMaxBytes", config.RequestBatchMaxBytes,
+		"RequestBatchMaxInterval", config.RequestBatchMaxInterval)
+
 	hc.Batcher = NewBatchBuilder(hc.requestPool, submittedChan, config.RequestBatchMaxCount, config.RequestBatchMaxBytes, config.RequestBatchMaxInterval)
 
 	return hc
@@ -179,7 +187,7 @@ func (hc *Consensus) processBatch() {
 	}()
 }
 
-func (c *Consensus) propose() {
+func (c *Consensus) propose(){
 	if c.Batcher.Closed() {
 		c.config.Logger.Debug("Batcher is closed, skipping propose")
 		return
@@ -188,7 +196,9 @@ func (c *Consensus) propose() {
 	// Check if there's already a proposal in progress for the current sequence
 	if c.currentViewObj.IsProposalInProgress() {
 		c.config.Logger.Debug("Proposal already in progress, will retry later",
-			"sequence", c.currentViewObj.Sequence)
+			"sequence", c.currentViewObj.Sequence,
+			"poolSize", c.requestPool.Size(),
+			"role", c.config.Role.String())
 		return
 	}
 
@@ -222,10 +232,9 @@ func (c *Consensus) propose() {
 func (hc *Consensus) HandleMessage(from NodeID, message Message) error {
 	switch message.Type {
 	case MsgRequest:
-		var requestMsg RequestMessage
-		if err := json.Unmarshal(message.Payload.([]byte), &requestMsg); err == nil {
+		if decoded, err := base64.StdEncoding.DecodeString(string(message.Payload.([]byte))); err == nil {
 			hc.config.Logger.Info("Received MsgRequest, processing directly", "from", from)
-			hc.handleRequest(requestMsg.Request.Data)
+			hc.handleRequest(decoded)
 		}
 	case MsgPrePrep:
 		var prePrepMsg PrePrepMessage
@@ -380,8 +389,7 @@ func (hc *Consensus) HandleMessage(from NodeID, message Message) error {
 
 // handleRequest processes incoming client requests
 func (hc *Consensus) handleRequest(request []byte) {
-	hc.config.Logger.Debug("Handling request")
-
+	hc.config.Logger.Debug("Handling request", "requestSize", len(request))
 	// Add request to pool (this has its own mutex)
 	hc.requestPool.Submit(request)
 

@@ -8,6 +8,7 @@ package binibft
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"time"
@@ -38,12 +39,16 @@ func (n *FabricNetworkAdapter) Send(nodeID binibftconsensus.NodeID, message bini
 		Timestamp: message.Timestamp,
 	}
 
-	// Marshal the payload
-	payloadBytes, err := json.Marshal(message.Payload)
-	if err != nil {
-		return err
+	var err error
+	if message.Type == binibftconsensus.MsgRequest {
+		fabricMsg.Payload = []byte(message.Payload.(string))
+	} else {
+		// Marshal the payload
+		fabricMsg.Payload, err = json.Marshal(message.Payload)
+		if err != nil {
+			return err
+		}
 	}
-	fabricMsg.Payload = payloadBytes
 
 	return n.comm.Send(NodeID(nodeID), fabricMsg)
 }
@@ -67,13 +72,14 @@ func (n *FabricNetworkAdapter) RegisterHandler(handler binibftconsensus.MessageH
 }
 
 func (n *FabricNetworkAdapter) SendTransaction(targetID binibftconsensus.NodeID, request []byte) error {
-	// For transaction forwarding, use the same Send mechanism
+	// For transaction forwarding, encode the raw bytes as base64 to avoid JSON marshaling issues
+	// This ensures the transaction data is preserved correctly over the network
 	msg := binibftconsensus.Message{
 		Type:      binibftconsensus.MsgRequest,
 		From:      binibftconsensus.NodeID("fabric"),
 		To:        targetID,
 		Timestamp: time.Now(),
-		Payload:   request,
+		Payload:   base64.StdEncoding.EncodeToString(request), // Encode as base64 string
 	}
 	return n.Send(targetID, msg)
 }

@@ -11,7 +11,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/hyperledger/binibft-poc/consensus/pkg/api"
@@ -78,7 +78,7 @@ func dirReadWalNames(dirPath string) ([]string, error) {
 		}
 	}
 
-	sort.Strings(walNames)
+	slices.Sort(walNames)
 
 	return walNames, nil
 }
@@ -86,7 +86,7 @@ func dirReadWalNames(dirPath string) ([]string, error) {
 // checkWalFiles for continuous sequence, readable CRC-Anchor.
 // If the last file cannot be read, it may be ignored,  (or repaired).
 func checkWalFiles(logger api.Logger, dirName string, walNames []string) ([]uint64, error) {
-	sort.Strings(walNames)
+	slices.Sort(walNames)
 
 	indexes := make([]uint64, 0)
 
@@ -131,13 +131,8 @@ func checkWalFiles(logger api.Logger, dirName string, walNames []string) ([]uint
 			return nil, errors.New("wal: files not in sequence")
 		}
 	}
-
-	sort.Slice(indexes,
-		func(i, j int) bool {
-			return indexes[i] < indexes[j]
-		},
-	)
-
+	
+	slices.Sort(indexes)
 	return indexes, nil
 }
 

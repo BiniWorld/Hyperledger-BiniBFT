@@ -6,17 +6,17 @@
 package consensus
 
 import (
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	protos "github.com/hyperledger/binibft-poc/consensus/binibftprotos"
 	algorithm "github.com/hyperledger/binibft-poc/consensus/internal/bft"
 	bft "github.com/hyperledger/binibft-poc/consensus/pkg/api"
 	"github.com/hyperledger/binibft-poc/consensus/pkg/metrics/disabled"
 	"github.com/hyperledger/binibft-poc/consensus/pkg/types"
-	protos "github.com/hyperledger/binibft-poc/consensus/binibftprotos"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
@@ -377,9 +377,7 @@ func (c *Consensus) setNodes(nodes []uint64) {
 func sortNodes(nodes []uint64) []uint64 {
 	sorted := make([]uint64, len(nodes))
 	copy(sorted, nodes)
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] < sorted[j]
-	})
+	slices.Sort(sorted)
 	return sorted
 }
 

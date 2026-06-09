@@ -2,7 +2,7 @@ package api
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 
 	"github.com/hyperledger/binibft-poc/consensus/pkg/metrics"
@@ -51,7 +51,7 @@ func NewHistogramOpts(old metrics.HistogramOpts, labelNames []string) metrics.Hi
 }
 
 func makeStatsdFormat(labelNames []string, str string) string {
-	sort.Strings(labelNames)
+	slices.Sort(labelNames)
 	for _, s := range labelNames {
 		str += fmt.Sprintf(".%%{%s}", s)
 	}
@@ -62,7 +62,7 @@ func makeStatsdFormat(labelNames []string, str string) string {
 func makeLabelNames(labelNames []string, names ...string) []string {
 	ln := make([]string, 0, len(names)+len(labelNames))
 	ln = append(ln, names...)
-	sort.Strings(labelNames)
+	slices.Sort(labelNames)
 	ln = append(ln, labelNames...)
 	return ln
 }

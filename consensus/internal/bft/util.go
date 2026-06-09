@@ -12,14 +12,14 @@ import (
 	"encoding/base64"
 	"fmt"
 	"math"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
 
+	protos "github.com/hyperledger/binibft-poc/consensus/binibftprotos"
 	"github.com/hyperledger/binibft-poc/consensus/pkg/api"
 	"github.com/hyperledger/binibft-poc/consensus/pkg/types"
-	protos "github.com/hyperledger/binibft-poc/consensus/binibftprotos"
 
 	"github.com/golang/protobuf/proto"
 )
@@ -185,7 +185,7 @@ func ComputeHierarchy(N, v int) (primary int, secondaries []int, followersOf map
 			followersSet = append(followersSet, n)
 		}
 	}
-	sort.Ints(followersSet)
+	slices.Sort(followersSet)
 	F := len(followersSet)
 	q := F / S
 	r := F % S

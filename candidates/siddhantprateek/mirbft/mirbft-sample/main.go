@@ -75,7 +75,9 @@ func (mb *MirBFT) Propose(request Request) {
 		Request:  request,
 	}
 
+	mb.Mutex.Lock()
 	mb.Pending[hash] = proposal
+	mb.Mutex.Unlock()
 
 	// Broadcast the proposal to other nodes
 	for _, recipient := range mb.Leaders {
@@ -92,13 +94,17 @@ func (mb *MirBFT) Propose(request Request) {
 }
 
 func (mb *MirBFT) ProcessProposal(proposal Proposal) {
+	mb.Mutex.Lock()
 	if mb.Received[proposal.LeaderID] == nil {
 		mb.Received[proposal.LeaderID] = make(map[string]bool)
 	}
 	mb.Received[proposal.LeaderID][proposal.Hash] = true
 
+	enoughProposals := len(mb.Received[proposal.LeaderID]) >= (mb.NumNodes/2)+1
+	mb.Mutex.Unlock()
+
 	// Check if there are enough unique proposals received from leaders
-	if len(mb.Received[proposal.LeaderID]) >= (mb.NumNodes/2)+1 {
+	if enoughProposals {
 		// Send acknowledgment to the leader
 		ackMsg := Message{
 			SenderID:  mb.NodeID,
@@ -114,13 +120,15 @@ func (mb *MirBFT) ProcessProposal(proposal Proposal) {
 }
 
 func (mb *MirBFT) Commit(hash string) {
-	if _, ok := mb.Pending[hash]; ok && !mb.Committed[hash] {
-		// Execute the request associated with the proposal
-		request := mb.Pending[hash].Request
-		ExecuteRequest(request)
-
-		// Mark the proposal as committed
+	mb.Mutex.Lock()
+	prop, exists := mb.Pending[hash]
+	isCommitted := mb.Committed[hash]
+	if exists && !isCommitted {
 		mb.Committed[hash] = true
+		mb.Mutex.Unlock()
+
+		// Execute the request associated with the proposal
+		ExecuteRequest(prop.Request)
 
 		// Broadcast the commit message to all nodes
 		commitMsg := Message{
@@ -130,6 +138,8 @@ func (mb *MirBFT) Commit(hash string) {
 		}
 		// Send the commit message to all nodes
 		SendMessage(commitMsg)
+	} else {
+		mb.Mutex.Unlock()
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 type Proposal struct {
@@ -21,6 +22,7 @@ type Learner struct {
 	mu         sync.Mutex
 	accepted   []Proposal
 	quorumSize int
+	decided    chan struct{} // Channel to notify when decided
 }
 
 type Proposer struct {
@@ -29,6 +31,7 @@ type Proposer struct {
 	value       interface{}
 	acceptors   []*Acceptor
 	learners    []*Learner
+	stop        chan struct{} // Channel to stop proposing
 }
 
 func NewAcceptor() *Acceptor {
@@ -36,7 +39,10 @@ func NewAcceptor() *Acceptor {
 }
 
 func NewLearner(quorumSize int) *Learner {
-	return &Learner{quorumSize: quorumSize}
+	return &Learner{
+		quorumSize: quorumSize,
+		decided:    make(chan struct{}),
+	}
 }
 
 func NewProposer(proposalNum int, value interface{}, acceptors []*Acceptor, learners []*Learner) *Proposer {
@@ -45,6 +51,18 @@ func NewProposer(proposalNum int, value interface{}, acceptors []*Acceptor, lear
 		value:       value,
 		acceptors:   acceptors,
 		learners:    learners,
+		stop:        make(chan struct{}),
+	}
+}
+
+func (p *Proposer) Stop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	select {
+	case <-p.stop:
+		// Already stopped
+	default:
+		close(p.stop)
 	}
 }
 
@@ -74,14 +92,25 @@ func (l *Learner) ReceiveAccepted(prop Proposal) bool {
 	defer l.mu.Unlock()
 	l.accepted = append(l.accepted, prop)
 	if len(l.accepted) >= l.quorumSize {
+		select {
+		case <-l.decided:
+			// Already closed
+		default:
+			close(l.decided)
+		}
 		return true
-	} else {
-		return false
 	}
+	return false
 }
 
 func (p *Proposer) Propose() {
 	for {
+		select {
+		case <-p.stop:
+			return
+		default:
+		}
+
 		p.mu.Lock()
 		n := p.proposalNum
 		p.mu.Unlock()
@@ -109,6 +138,8 @@ func (p *Proposer) Propose() {
 				p.mu.Lock()
 				p.proposalNum++
 				p.mu.Unlock()
+				// Wait/backoff briefly before next proposal round to reduce contention
+				time.Sleep(10 * time.Millisecond)
 			} else {
 				p.mu.Lock()
 				p.proposalNum++
@@ -127,8 +158,20 @@ func (p *Proposer) Propose() {
 					for _, learner := range p.learners {
 						learner.ReceiveAccepted(Proposal{Number: n, Value: p.value, Decided: true})
 					}
+					// Consensus has been reached successfully, terminate proposal loop.
+					return
+				} else {
+					// Failed accept phase: backoff briefly
+					time.Sleep(10 * time.Millisecond)
 				}
 			}
+		} else {
+			// Prepare phase failed to reach quorum.
+			// Increment proposal number to prepare for next round and sleep to avoid busy spin.
+			p.mu.Lock()
+			p.proposalNum++
+			p.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }

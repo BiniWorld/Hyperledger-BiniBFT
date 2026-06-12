@@ -21,12 +21,28 @@ func TestPaxosConsensus(t *testing.T) {
 		learners[i] = NewLearner(numAcceptors/2 + 1)
 	}
 
+	proposers := make([]*Proposer, numProposers)
 	for i := 0; i < numProposers; i++ {
-		proposer := NewProposer(i, fmt.Sprintf("Value from Proposer %d", i), acceptors, learners)
-		go proposer.Propose()
+		// Initialize proposers starting at proposalNum >= 1 to exceed acceptor's promisedNum (0)
+		proposers[i] = NewProposer(i+1, fmt.Sprintf("Value from Proposer %d", i), acceptors, learners)
+		go proposers[i].Propose()
 	}
 
-	time.Sleep(1 * time.Second)
+	// Wait for all learners to decide using event channel with a timeout
+	for i, learner := range learners {
+		select {
+		case <-learner.decided:
+			// Consensus reached for this learner
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Timeout waiting for learner %d to decide", i)
+		}
+	}
+
+	// Clean up proposers
+	for _, proposer := range proposers {
+		proposer.Stop()
+	}
+
 	for _, learner := range learners {
 		if len(learner.accepted) == 0 {
 			t.Errorf("Learner did not receive any accepted proposals.")
@@ -42,10 +58,19 @@ func TestPaxosConsensus(t *testing.T) {
 func TestPaxosProposer(t *testing.T) {
 	acceptor := NewAcceptor()
 	learner := NewLearner(1)
-	proposer := NewProposer(0, "Test Value", []*Acceptor{acceptor}, []*Learner{learner})
+	// Proposer proposalNum must start at >= 1 to be accepted by the acceptor (promisedNum starts at 0)
+	proposer := NewProposer(1, "Test Value", []*Acceptor{acceptor}, []*Learner{learner})
 
 	go proposer.Propose()
-	time.Sleep(100 * time.Millisecond)
+	defer proposer.Stop()
+
+	// Wait for learner to decide
+	select {
+	case <-learner.decided:
+		// Decided successfully
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Timeout waiting for learner to decide")
+	}
 
 	if len(learner.accepted) != 1 {
 		t.Errorf("Learner did not receive the accepted proposal.")

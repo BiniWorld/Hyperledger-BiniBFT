@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"container/list"
+	"crypto/sha256"
 	"fmt"
 	"sync"
 	"time"
@@ -114,7 +115,17 @@ func (rp *RequestPool) Submit(request []byte) error {
 		return fmt.Errorf("cannot submit empty request")
 	}
 
-	reqInfo := rp.inspector.RequestID(request)
+	var reqInfo RequestInfo
+	if rp.inspector != nil {
+		reqInfo = rp.inspector.RequestID(request)
+	} else {
+		h := sha256.Sum256(request)
+		reqInfo = RequestInfo{
+			ClientID: "default-client",
+			ID:       fmt.Sprintf("%x", h),
+		}
+	}
+
 	if reqInfo.ClientID == "" || reqInfo.ClientID == "invalid" || reqInfo.ClientID == "invalid-client" || reqInfo.ID == "" {
 		return fmt.Errorf("rejected malformed request: invalid client or transaction ID")
 	}

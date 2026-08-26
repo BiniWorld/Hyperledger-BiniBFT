@@ -103,31 +103,49 @@ type Block struct {
 }
 
 func (block Block) ToBytes() []byte {
-	rawHeader, err := json.Marshal(block)
+	raw, err := json.Marshal(block)
 	if err != nil {
-		panic(err)
+		return nil
 	}
-	return rawHeader
+	return raw
 }
 
-func BlockFromBytes(rawHeader []byte) *Block {
+func (block Block) ToBytesChecked() ([]byte, error) {
+	return json.Marshal(block)
+}
+
+func BlockFromBytes(raw []byte) (*Block, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty block bytes")
+	}
 	var block Block
-	json.Unmarshal(rawHeader, &block)
-	return &block
+	if err := json.Unmarshal(raw, &block); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block: %w", err)
+	}
+	return &block, nil
 }
 
 func (txn Transaction) ToBytes() []byte {
-	rawTxn, err := json.Marshal(txn)
+	raw, err := json.Marshal(txn)
 	if err != nil {
-		panic(err)
+		return nil
 	}
-	return rawTxn
+	return raw
 }
 
-func TransactionFromBytes(rawTxn []byte) *Transaction {
+func (txn Transaction) ToBytesChecked() ([]byte, error) {
+	return json.Marshal(txn)
+}
+
+func TransactionFromBytes(raw []byte) (*Transaction, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty transaction bytes")
+	}
 	var txn Transaction
-	json.Unmarshal(rawTxn, &txn)
-	return &txn
+	if err := json.Unmarshal(raw, &txn); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal transaction: %w", err)
+	}
+	return &txn, nil
 }
 
 type BlockHeader struct {
@@ -137,17 +155,26 @@ type BlockHeader struct {
 }
 
 func (header BlockHeader) ToBytes() []byte {
-	rawHeader, err := asn1.Marshal(header)
+	raw, err := asn1.Marshal(header)
 	if err != nil {
-		panic(err)
+		return nil
 	}
-	return rawHeader
+	return raw
 }
 
-func BlockHeaderFromBytes(rawHeader []byte) *BlockHeader {
+func (header BlockHeader) ToBytesChecked() ([]byte, error) {
+	return asn1.Marshal(header)
+}
+
+func BlockHeaderFromBytes(raw []byte) (*BlockHeader, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty block header bytes")
+	}
 	var header BlockHeader
-	asn1.Unmarshal(rawHeader, &header)
-	return &header
+	if _, err := asn1.Unmarshal(raw, &header); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block header: %w", err)
+	}
+	return &header, nil
 }
 
 type BlockData struct {
@@ -155,17 +182,26 @@ type BlockData struct {
 }
 
 func (b BlockData) ToBytes() []byte {
-	rawBlock, err := asn1.Marshal(b)
+	raw, err := asn1.Marshal(b)
 	if err != nil {
-		panic(err)
+		return nil
 	}
-	return rawBlock
+	return raw
 }
 
-func BlockDataFromBytes(rawBlock []byte) *BlockData {
+func (b BlockData) ToBytesChecked() ([]byte, error) {
+	return asn1.Marshal(b)
+}
+
+func BlockDataFromBytes(raw []byte) (*BlockData, error) {
+	if len(raw) == 0 {
+		return nil, fmt.Errorf("empty block data bytes")
+	}
 	var block BlockData
-	asn1.Unmarshal(rawBlock, &block)
-	return &block
+	if _, err := asn1.Unmarshal(raw, &block); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block data: %w", err)
+	}
+	return &block, nil
 }
 
 // Config holds the configuration for the consensus instance

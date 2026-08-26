@@ -28,6 +28,8 @@ const (
 	MsgElectionAck
 	MsgShardAssignment
 	MsgLeaderAnnouncement
+	MsgSyncRequest
+	MsgSyncResponse
 )
 
 // Message represents a consensus message
@@ -227,4 +229,26 @@ type LeaderAnnouncementMessage struct {
 	ShardNodes    map[ShardID][]NodeID
 	Timestamp     time.Time
 	Signature     []byte
+}
+
+// SyncRequestMessage requests a range of blocks for catch-up synchronization
+type SyncRequestMessage struct {
+	FromNodeID    NodeID
+	ShardID       ShardID
+	StartSequence uint64
+	EndSequence   uint64
+	Timestamp     time.Time
+	Signature     []byte
+}
+
+// SyncResponseMessage delivers requested blocks and QC proofs for catch-up synchronization
+type SyncResponseMessage struct {
+	FromNodeID  NodeID
+	ShardID     ShardID
+	Blocks      []*Block
+	CommitQCs   map[uint64]*CommitQC
+	LatestSeq   uint64
+	Error       string
+	Timestamp   time.Time
+	Signature   []byte
 }

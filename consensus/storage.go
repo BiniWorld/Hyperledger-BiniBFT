@@ -2,7 +2,6 @@ package consensus
 
 import (
 	"fmt"
-	"log"
 	"strconv"
 	"sync"
 
@@ -17,6 +16,7 @@ type BlockStorage interface {
 	Close() error
 	GetLatestBlock() (*Block, error)
 	GetBlockByHeight(height uint64) (*Block, error)
+	GetBlockRange(startSeq, endSeq uint64) ([]*Block, error)
 	StoreBlock(block *Block) error
 }
 
@@ -44,7 +44,7 @@ func NewLevelDBStorage(dbPath string) (*LevelDBStorage, error) {
 
 	// Try to load the latest block from storage
 	if latestBlockBytes, err := db.Get([]byte("latest_block"), nil); err == nil {
-		latestBlock := BlockFromBytes(latestBlockBytes)
+		latestBlock, _ := BlockFromBytes(latestBlockBytes)
 		storage.latestBlock = latestBlock
 	}
 
@@ -65,19 +65,27 @@ func (s *LevelDBStorage) Get(key []byte) ([]byte, error) {
 	return s.db.Get(key, nil)
 }
 
-// StoreBlock stores a block in LevelDB
+// StoreBlock stores a block in LevelDB safely without panicking
 func (s *LevelDBStorage) StoreBlock(block *Block) error {
+	if block == nil {
+		return fmt.Errorf("cannot store nil block")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	err := s.db.Put([]byte(strconv.FormatUint(uint64(block.Sequence), 10)), block.ToBytes(), &opt.WriteOptions{})
+	raw := block.ToBytes()
+	if len(raw) == 0 {
+		return fmt.Errorf("failed to encode block")
+	}
+
+	err := s.db.Put([]byte(strconv.FormatUint(uint64(block.Sequence), 10)), raw, &opt.WriteOptions{})
 	if err != nil {
-		log.Panicf("Error storing block: %v", err)
+		return fmt.Errorf("error storing block at sequence %d: %w", block.Sequence, err)
 	}
 	// set index for latest block
-	err = s.db.Put([]byte("latest_block"), block.ToBytes(), &opt.WriteOptions{})
+	err = s.db.Put([]byte("latest_block"), raw, &opt.WriteOptions{})
 	if err != nil {
-		log.Panicf("Error storing latest block: %v", err)
+		return fmt.Errorf("error updating latest_block pointer: %w", err)
 	}
 
 	// Update the in-memory cache
@@ -96,15 +104,42 @@ func (s *LevelDBStorage) GetBlock(sequenceKey string) (*Block, error) {
 		return nil, fmt.Errorf("block not found: %w", err)
 	}
 
-	block := BlockFromBytes(blockBytes)
+	block, err := BlockFromBytes(blockBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode block %s: %w", sequenceKey, err)
+	}
 	return block, nil
 }
 
 // GetBlockByHeight retrieves a block by height
 func (s *LevelDBStorage) GetBlockByHeight(height uint64) (*Block, error) {
+	return s.GetBlock(strconv.FormatUint(height, 10))
+}
+
+// GetBlockRange retrieves a continuous slice of blocks between startSeq and endSeq
+func (s *LevelDBStorage) GetBlockRange(startSeq, endSeq uint64) ([]*Block, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.GetBlock(strconv.FormatUint(height, 10))
+
+	if startSeq > endSeq {
+		return nil, fmt.Errorf("invalid range: startSeq (%d) > endSeq (%d)", startSeq, endSeq)
+	}
+
+	blocks := make([]*Block, 0, endSeq-startSeq+1)
+	for seq := startSeq; seq <= endSeq; seq++ {
+		key := strconv.FormatUint(seq, 10)
+		blockBytes, err := s.db.Get([]byte(key), nil)
+		if err != nil {
+			break // Stop if sequence gap reached
+		}
+		block, err := BlockFromBytes(blockBytes)
+		if err != nil {
+			break
+		}
+		blocks = append(blocks, block)
+	}
+
+	return blocks, nil
 }
 
 // GetLatestBlock returns the latest block
@@ -117,7 +152,11 @@ func (s *LevelDBStorage) GetLatestBlock() (*Block, error) {
 		if err != nil {
 			return nil, fmt.Errorf("no latest block found: %w", err)
 		}
-		s.latestBlock = BlockFromBytes(latestBlockBytes)
+		block, err := BlockFromBytes(latestBlockBytes)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode latest block: %w", err)
+		}
+		s.latestBlock = block
 	}
 
 	return s.latestBlock, nil

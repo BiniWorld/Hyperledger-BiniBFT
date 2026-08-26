@@ -59,7 +59,9 @@ type RequestPoolOptions struct {
 	MaxSize       uint64
 	Logger        Logger
 	insepctor     RequestInspector
+	Inspector     RequestInspector
 	submittedChan chan struct{}
+	SubmittedChan chan struct{}
 	Network       NetworkInterface
 	NodeID        NodeID
 	Role          NodeRole
@@ -79,6 +81,15 @@ func NewRequestPoolWithOptions(opts RequestPoolOptions) *RequestPool {
 		opts.MaxSize = 10000
 	}
 
+	inspector := opts.Inspector
+	if inspector == nil {
+		inspector = opts.insepctor
+	}
+	submittedChan := opts.SubmittedChan
+	if submittedChan == nil {
+		submittedChan = opts.submittedChan
+	}
+
 	return &RequestPool{
 		requests:      make(map[string]*Request),
 		maxSize:       opts.MaxSize,
@@ -86,8 +97,8 @@ func NewRequestPoolWithOptions(opts RequestPoolOptions) *RequestPool {
 		logger:        opts.Logger,
 		closed:        false,
 		fifo:          list.New(),
-		inspector:     opts.insepctor,
-		submittedChan: opts.submittedChan,
+		inspector:     inspector,
+		submittedChan: submittedChan,
 		network:       opts.Network,
 		nodeID:        opts.NodeID,
 		role:          opts.Role,
@@ -99,7 +110,14 @@ func NewRequestPoolWithOptions(opts RequestPoolOptions) *RequestPool {
 
 // Submit adds a request to the pool or forwards it to the primary leader
 func (rp *RequestPool) Submit(request []byte) error {
+	if len(request) == 0 {
+		return fmt.Errorf("cannot submit empty request")
+	}
+
 	reqInfo := rp.inspector.RequestID(request)
+	if reqInfo.ClientID == "" || reqInfo.ClientID == "invalid" || reqInfo.ClientID == "invalid-client" || reqInfo.ID == "" {
+		return fmt.Errorf("rejected malformed request: invalid client or transaction ID")
+	}
 
 	if rp.isClosed() {
 		return errors.Errorf("pool closed, request rejected: %s", reqInfo)
@@ -115,7 +133,7 @@ func (rp *RequestPool) Submit(request []byte) error {
 
 	// If this node is not the primary leader, forward the request to the primary leader
 	if rp.role != RolePrimaryLeader && rp.network != nil && rp.primaryLeader != "" && rp.primaryLeader != rp.nodeID {
-		rp.logger.Info("Forwarding request to primary leader",
+		rp.logInfo("Forwarding request to primary leader",
 			"nodeID", rp.nodeID,
 			"role", rp.role.String(),
 			"primaryLeader", rp.primaryLeader,
@@ -139,12 +157,12 @@ func (rp *RequestPool) Submit(request []byte) error {
 	_, alreadyDelete := rp.delMap[reqInfo]
 
 	if alreadyExists {
-		rp.logger.Debug("request already exists in the pool", "reqInfo", reqInfo)
+		rp.logDebug("request already exists in the pool", "reqInfo", reqInfo)
 		return ErrReqAlreadyExists
 	}
 
 	if alreadyDelete {
-		rp.logger.Debug("request %s already processed", "reqInfo", reqInfo)
+		rp.logDebug("request %s already processed", "reqInfo", reqInfo)
 		return ErrReqAlreadyProcessed
 	}
 
@@ -159,7 +177,7 @@ func (rp *RequestPool) Submit(request []byte) error {
 
 	// Verify consistency after adding
 	if len(rp.existMap) != rp.fifo.Len() {
-		rp.logger.Error("RequestPool map and list are of different length after adding",
+		rp.logError("RequestPool map and list are of different length after adding",
 			"map", len(rp.existMap),
 			"list", rp.fifo.Len(),
 			"reqInfo", reqInfo)
@@ -169,12 +187,14 @@ func (rp *RequestPool) Submit(request []byte) error {
 		return fmt.Errorf("internal consistency error in request pool")
 	}
 
-	rp.logger.Debug("Request submitted to local pool", "reqInfo", reqInfo, "nodeID", rp.nodeID)
+	rp.logDebug("Request submitted to local pool", "reqInfo", reqInfo, "nodeID", rp.nodeID)
 
 	// notify that a request was submitted
-	select {
-	case rp.submittedChan <- struct{}{}:
-	default:
+	if rp.submittedChan != nil {
+		select {
+		case rp.submittedChan <- struct{}{}:
+		default:
+		}
 	}
 
 	rp.sizeBytes += uint64(len(element.Value.(*requestItem).request))
@@ -194,12 +214,12 @@ func (rp *RequestPool) GetRequest(requestID string) (*Request, bool) {
 func (rp *RequestPool) UpdateRequestPhase(requestID string, phase RequestPhase) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
+
 	if req, exists := rp.requests[requestID]; exists {
 		oldPhase := req.Phase
 		req.Phase = phase
-		if rp.logger != nil {
-			rp.logger.Debug("Updated request phase", "requestID", requestID, "oldPhase", oldPhase.String(), "newPhase", phase.String())
-		}
+		req.Timestamp = time.Now()
+		rp.logDebug("Updated request phase", "requestID", requestID, "oldPhase", oldPhase.String(), "newPhase", phase.String())
 	}
 }
 
@@ -208,51 +228,52 @@ func (rp *RequestPool) RemoveRequest(requestID string) error {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
 
-	if _, exists := rp.requests[requestID]; !exists {
-		return fmt.Errorf("request %s not found", requestID)
-	}
-
-	delete(rp.requests, requestID)
-
-	// Clean up timeout if exists
 	if timer, exists := rp.timeouts[requestID]; exists {
 		timer.Stop()
 		delete(rp.timeouts, requestID)
 	}
 
-	if rp.logger != nil {
-		rp.logger.Debug("Removed request from pool", "requestID", requestID)
+	if req, exists := rp.requests[requestID]; exists {
+		rp.sizeBytes -= uint64(len(req.Data))
+		delete(rp.requests, requestID)
+		rp.logDebug("Removed request from pool", "requestID", requestID)
+		return nil
 	}
 
-	return nil
+	return fmt.Errorf("request %s not found in pool", requestID)
 }
 
-// Size returns the number of requests in the pool
+// Size returns the number of pending requests in the pool
 func (rp *RequestPool) Size() int {
 	rp.mu.RLock()
 	defer rp.mu.RUnlock()
-	return len(rp.requests)
+	return rp.fifo.Len()
 }
 
-// Close closes the request pool
+// SizeBytes returns the total size of pending requests in bytes
+func (rp *RequestPool) SizeBytes() uint64 {
+	rp.mu.RLock()
+	defer rp.mu.RUnlock()
+	return rp.sizeBytes
+}
+
+// Close closes the request pool and stops all timers
 func (rp *RequestPool) Close() {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
 
+	if rp.closed {
+		return
+	}
+
 	rp.closed = true
 
-	// Stop all timers
+	// Stop all timeout timers
 	for _, timer := range rp.timeouts {
 		timer.Stop()
 	}
-
-	// Clear all data
-	rp.requests = make(map[string]*Request)
 	rp.timeouts = make(map[string]*time.Timer)
-
-	if rp.logger != nil {
-		rp.logger.Debug("Request pool closed")
-	}
+	rp.logDebug("Request pool closed")
 }
 
 // GetRequestsByPhase returns all requests in a specific phase
@@ -260,31 +281,31 @@ func (rp *RequestPool) GetRequestsByPhase(phase RequestPhase) []*Request {
 	rp.mu.RLock()
 	defer rp.mu.RUnlock()
 
-	var requests []*Request
+	var result []*Request
 	for _, req := range rp.requests {
 		if req.Phase == phase {
-			requests = append(requests, req)
+			result = append(result, req)
 		}
 	}
-	return requests
+	return result
 }
 
 func (rp *RequestPool) NextRequests(maxCount int, maxSizeBytes uint64, check bool) (batch [][]byte, full bool) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
 
-	count := minInt(rp.fifo.Len(), maxCount)
 	var totalSize uint64
-	batch = make([][]byte, 0, count)
 	var elementsToRemove []*list.Element
 	var requestInfosToRemove []RequestInfo
+
 	element := rp.fifo.Front()
+	count := rp.fifo.Len()
 
 	for i := 0; i < count && element != nil; i++ {
 		req := element.Value.(*requestItem).request
 		reqLen := uint64(len(req))
 		if totalSize+reqLen > maxSizeBytes {
-			rp.logger.Debug(fmt.Sprintf("Returning batch of %d requests totalling %dB as it exceeds threshold of %dB",
+			rp.logDebug(fmt.Sprintf("Returning batch of %d requests totalling %dB as it exceeds threshold of %dB",
 				len(batch), totalSize, maxSizeBytes))
 			break
 		}
@@ -315,7 +336,7 @@ func (rp *RequestPool) NextRequests(maxCount int, maxSizeBytes uint64, check boo
 
 		// Verify consistency after removal
 		if len(rp.existMap) != rp.fifo.Len() {
-			rp.logger.Error("RequestPool map and list are of different length after removal",
+			rp.logError("RequestPool map and list are of different length after removal",
 				"map", len(rp.existMap),
 				"list", rp.fifo.Len())
 		}
@@ -325,7 +346,7 @@ func (rp *RequestPool) NextRequests(maxCount int, maxSizeBytes uint64, check boo
 	fullC := len(batch) == maxCount
 	full = fullS || fullC
 	if len(batch) > 0 {
-		rp.logger.Debug(fmt.Sprintf("Returning batch of %d requests totalling %dB",
+		rp.logDebug(fmt.Sprintf("Returning batch of %d requests totalling %dB",
 			len(batch), totalSize))
 	}
 	return batch, full
@@ -336,4 +357,22 @@ func (rp *RequestPool) isClosed() bool {
 	defer rp.mu.Unlock()
 
 	return rp.closed
+}
+
+func (rp *RequestPool) logInfo(msg string, fields ...interface{}) {
+	if rp.logger != nil {
+		rp.logger.Info(msg, fields...)
+	}
+}
+
+func (rp *RequestPool) logDebug(msg string, fields ...interface{}) {
+	if rp.logger != nil {
+		rp.logger.Debug(msg, fields...)
+	}
+}
+
+func (rp *RequestPool) logError(msg string, fields ...interface{}) {
+	if rp.logger != nil {
+		rp.logger.Error(msg, fields...)
+	}
 }

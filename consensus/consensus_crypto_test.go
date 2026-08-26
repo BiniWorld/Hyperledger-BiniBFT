@@ -67,6 +67,24 @@ func (v *testVerifier) VerifyProposalSignature(nodeID NodeID, proposal Proposal,
 	return v.VerifyDigestSignature(nodeID, []byte(proposal.Digest()), sig.Value)
 }
 
+func (v *testVerifier) VerifyRequest(request []byte) (RequestInfo, error) {
+	if len(request) == 0 {
+		return RequestInfo{}, fmt.Errorf("empty request")
+	}
+	return RequestInfo{ClientID: "test-client", ID: string(request)}, nil
+}
+
+func (v *testVerifier) VerifyProposal(proposal Proposal) ([]RequestInfo, error) {
+	if len(proposal.Header) == 0 && len(proposal.Payload) == 0 {
+		return nil, fmt.Errorf("empty proposal")
+	}
+	return []RequestInfo{{ClientID: "test-client", ID: "test-id"}}, nil
+}
+
+func (v *testVerifier) RequestsFromProposal(proposal Proposal) []RequestInfo {
+	return []RequestInfo{{ClientID: "test-client", ID: "test-id"}}
+}
+
 type mockNetwork struct{}
 
 func (m *mockNetwork) Send(nodeID NodeID, message Message) error              { return nil }

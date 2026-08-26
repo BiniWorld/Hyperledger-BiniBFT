@@ -250,6 +250,14 @@ func (v *View) HandlePrePrepare(msg *PrePrepMessage) error {
 		}
 	}
 
+	// Verify proposal structure and batch payload if verifier is configured
+	if v.config.Verifier != nil && (len(msg.Proposal.Header) > 0 || len(msg.Proposal.Payload) > 0) {
+		if _, err := v.config.Verifier.VerifyProposal(msg.Proposal); err != nil {
+			v.logger.Error("Invalid proposal in PrePrep message", "from", msg.NodeID, "error", err)
+			return fmt.Errorf("invalid proposal in PrePrep message: %w", err)
+		}
+	}
+
 	// Handle sequence synchronization
 	if !v.isValidSequenceRange(msg.Sequence) {
 		v.logger.Debug("Received pre-prep for sequence outside valid range, ignoring",

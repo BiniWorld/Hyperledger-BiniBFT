@@ -260,11 +260,14 @@ type Signer interface {
 	SignDigest(digest []byte) ([]byte, error)
 }
 
-// Verifier interface for verifying node signatures and quorum certificates
+// Verifier interface for verifying node signatures, proposals, and requests
 type Verifier interface {
 	VerifySignature(nodeID NodeID, data []byte, signature []byte) error
 	VerifyDigestSignature(nodeID NodeID, digest []byte, signature []byte) error
 	VerifyProposalSignature(nodeID NodeID, proposal Proposal, sig Signature) error
+	VerifyRequest(request []byte) (RequestInfo, error)
+	VerifyProposal(proposal Proposal) ([]RequestInfo, error)
+	RequestsFromProposal(proposal Proposal) []RequestInfo
 }
 
 // ShardQC represents an intra-shard quorum certificate

@@ -3,12 +3,11 @@ package main
 import (
 	"binibft-poc/consensus"
 	"binibft-poc/consensus/protos"
-	"fmt"
 
 	"github.com/golang/protobuf/proto"
 )
 
-// AssembleProposal creates a block proposal from transaction requests
+// AssembleProposal creates a block proposal from transaction requests safely
 func (n *Node) AssembleProposal(metadata []byte, requests [][]byte) consensus.Proposal {
 	n.logger.Info("Node assembling proposal", "nodeID", n.id, "requestCount", len(requests))
 
@@ -16,17 +15,25 @@ func (n *Node) AssembleProposal(metadata []byte, requests [][]byte) consensus.Pr
 		Transactions: requests,
 	}.ToBytes()
 
-	md := &protos.ViewMetadata{}
-	if err := proto.Unmarshal(metadata, md); err != nil {
-		panic(fmt.Sprintf("Unable to unmarshal metadata, error: %v", err))
+	var latestSeq uint64 = 0
+	if len(metadata) > 0 {
+		md := &protos.ViewMetadata{}
+		if err := proto.Unmarshal(metadata, md); err == nil {
+			latestSeq = md.LatestSequence
+		} else {
+			n.logger.Error("Failed to unmarshal metadata in AssembleProposal", "error", err)
+		}
 	}
+
+	header := BlockHeader{
+		PrevHash: n.prevHash,
+		DataHash: computeDigest(blockData),
+		Sequence: int64(latestSeq),
+	}.ToBytes()
+
 	return consensus.Proposal{
-		Header: BlockHeader{
-			PrevHash: n.prevHash,
-			DataHash: computeDigest(blockData),
-			Sequence: int64(md.LatestSequence),
-		}.ToBytes(),
-		Payload:  BlockData{Transactions: requests}.ToBytes(),
+		Header:   header,
+		Payload:  blockData,
 		Metadata: metadata,
 	}
 }

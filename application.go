@@ -12,7 +12,11 @@ import (
 
 // Deliver processes finalized proposals and creates blocks for the application
 func (n *Node) Deliver(proposal consensus.Proposal) error {
-	blockData := BlockDataFromBytes(proposal.Payload)
+	blockData, err := BlockDataFromBytes(proposal.Payload)
+	if err != nil {
+		return fmt.Errorf("unable to decode proposal payload: %w", err)
+	}
+
 	metadata := &protos.ViewMetadata{}
 	if err := proto.Unmarshal(proposal.Metadata, metadata); err != nil {
 		return fmt.Errorf("unable to unmarshal metadata: %v", err)
@@ -26,18 +30,27 @@ func (n *Node) Deliver(proposal consensus.Proposal) error {
 	// Convert raw transaction bytes to Transaction structs
 	txns := make([]consensus.Transaction, 0, len(blockData.Transactions))
 	for _, rawTxn := range blockData.Transactions {
-		txn := TransactionFromBytes(rawTxn)
+		txn, err := TransactionFromBytes(rawTxn)
+		if err != nil {
+			n.logger.Error("Failed to decode transaction during delivery", "error", err)
+			continue
+		}
 		txns = append(txns, consensus.Transaction{
 			ClientID: txn.ClientID,
 			TS:       txn.TS,
 			ID:       txn.ID,
 			Data:     txn.Data,
 		})
-		metrix[txn.ID].EndTime = time.Now()
+		if m, ok := metrix[txn.ID]; ok && m != nil {
+			m.EndTime = time.Now()
+		}
 	}
 
 	// Extract block header information
-	header := BlockHeaderFromBytes(proposal.Header)
+	header, err := BlockHeaderFromBytes(proposal.Header)
+	if err != nil {
+		return fmt.Errorf("unable to decode block header: %w", err)
+	}
 
 	// Store the block using the consensus storage system
 	block := &consensus.Block{

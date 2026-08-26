@@ -336,10 +336,7 @@ func (v *View) forwardPrePrepToFollowers(prePrepMsg *PrePrepMessage) {
 // checkFollowerMajority checks if majority of followers have sent pre-prep ACKs
 func (v *View) checkFollowerMajority(sequence uint64) {
 	shardNodes := v.config.ShardNodes[v.config.ShardID]
-	requiredCount := int(float64(len(shardNodes)) * v.config.ShardMajorityThreshold)
-	if requiredCount < 1 {
-		requiredCount = 1
-	}
+	requiredCount := CalculateIntraShardQuorum(len(shardNodes))
 
 	// Count pre-prep ACKs from followers in this shard (including self)
 	ackCount := 1 // Count self as ACK
@@ -978,7 +975,7 @@ func (v *View) recordIntraShardVote(sequence uint64, phase string, nodeID NodeID
 // checkIntraShardMajority checks if we have majority votes and sends ACK to shard leader
 func (v *View) checkIntraShardMajority(sequence uint64, phase string) {
 	shardNodes := v.config.ShardNodes[v.config.ShardID]
-	requiredCount := (len(shardNodes) / 2) + 1 // Simple majority
+	requiredCount := CalculateIntraShardQuorum(len(shardNodes))
 
 	votes, exists := v.intraShardVotes[sequence][phase]
 	if !exists {
@@ -1311,20 +1308,26 @@ func (v *View) sendCommitAckToPrimary(sequence uint64) {
 		"fromShardLeader", v.config.NodeID)
 }
 
-// checkPrimaryCommitQuorum checks if majority of shard leaders have committed
+// checkPrimaryCommitQuorum checks if BFT cross-shard quorum of shard leaders have committed
 func (v *View) checkPrimaryCommitQuorum(sequence uint64) {
 	// Count commit ACKs from shard leaders
 	commitAckCount := 0
+	shardQCs := make(map[ShardID]*ShardQC)
+
 	if acks, exists := v.shardAcks[sequence]; exists {
 		for _, ack := range acks {
 			if ack.Phase == "commit" && ack.Acknowledged {
 				commitAckCount++
+				if len(ack.Signatures) > 0 {
+					shardQCs[ack.ShardID] = CreateShardQC(v.config.ChannelID, v.Number, sequence, "commit", ack.ShardID, ack.Digest, ack.Signatures)
+				}
 			}
 		}
 	}
 
-	// totalShardLeaders := len(v.config.ShardLeaders)
-	// Count only other shard leaders (excluding primary leader itself)
+	totalShards := len(v.config.ShardLeaders)
+	requiredCount := CalculateCrossShardQuorum(totalShards)
+
 	otherShardLeaders := 0
 	for _, shardLeader := range v.config.ShardLeaders {
 		if shardLeader != v.config.NodeID {
@@ -1332,18 +1335,14 @@ func (v *View) checkPrimaryCommitQuorum(sequence uint64) {
 		}
 	}
 
-	requiredCount := int(float64(otherShardLeaders) * v.config.CrossShardThreshold)
-	if requiredCount < 1 && otherShardLeaders > 0 {
-		requiredCount = 1
-	}
-
 	v.logger.Info("Checking primary commit quorum",
 		"sequence", sequence,
 		"commitAckCount", commitAckCount,
 		"requiredCount", requiredCount,
+		"totalShards", totalShards,
 		"otherShardLeaders", otherShardLeaders)
 
-	// If there are no other shard leaders, or we have enough ACKs, finalize
+	// If there are no other shard leaders, or we have reached cross-shard quorum, finalize
 	if otherShardLeaders == 0 || commitAckCount >= requiredCount {
 		v.logger.Info("Primary commit quorum reached - consensus complete", "sequence", sequence)
 		// Get the proposal from pre-prepare messages (primary leader has these)

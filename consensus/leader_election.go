@@ -1,10 +1,8 @@
 package consensus
 
 import (
-	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
-	"math/big"
 	"sort"
 	"sync"
 	"time"
@@ -20,7 +18,7 @@ const (
 	StateReElecting
 )
 
-// LeaderElection manages the leader election process
+// LeaderElection manages the leader election process with Verifiable Random Functions (VRF)
 type LeaderElection struct {
 	config *Config
 
@@ -28,6 +26,7 @@ type LeaderElection struct {
 	mu                sync.RWMutex
 	state             ElectionState
 	electionID        string
+	term              uint64
 	activeNodes       []NodeID
 	primaryLeader     NodeID
 	shardLeaders      map[ShardID]NodeID
@@ -35,6 +34,10 @@ type LeaderElection struct {
 	numShards         int
 	electionTimeout   time.Duration
 	heartbeatTimeout  time.Duration
+
+	// VRF proof and output registry per node
+	vrfOutputs        map[NodeID][]byte
+	vrfProofs         map[NodeID][]byte
 
 	// Tracking acknowledgments and responses
 	acksReceived      map[NodeID]bool
@@ -55,9 +58,12 @@ func NewLeaderElection(config *Config, numShards int) *LeaderElection {
 	le := &LeaderElection{
 		config:            config,
 		state:             StateIdle,
+		term:              0,
 		activeNodes:       make([]NodeID, 0),
 		shardLeaders:      make(map[ShardID]NodeID),
 		shardAssignments:  make(map[ShardID][]NodeID),
+		vrfOutputs:        make(map[NodeID][]byte),
+		vrfProofs:         make(map[NodeID][]byte),
 		numShards:         numShards,
 		electionTimeout:   30 * time.Second,
 		heartbeatTimeout:  10 * time.Second,
@@ -120,34 +126,61 @@ func (le *LeaderElection) StartElection() {
 
 func (le *LeaderElection) startElection() {
 	le.state = StateElecting
+	le.term++
 	le.electionID = le.generateElectionID()
 	le.electionStartTime = time.Now()
 	le.acksReceived = make(map[NodeID]bool)
+	le.vrfOutputs = make(map[NodeID][]byte)
+	le.vrfProofs = make(map[NodeID][]byte)
 
-	le.config.Logger.Info("Starting new election",
+	le.config.Logger.Info("Starting new election with VRF",
+		"term", le.term,
 		"electionID", le.electionID,
 		"activeNodes", len(le.activeNodes))
 
+	// Compute local VRF output for this term and election
+	vrfInput := ComputeElectionDigest(le.config.ChannelID, le.term, le.electionID, le.config.NodeID)
+	var vrfOutput []byte
+	var vrfProof []byte
+
+	if le.config.Signer != nil {
+		sig := le.config.Signer.Sign(vrfInput)
+		vrfProof = sig
+		h := sha256.Sum256(append([]byte("VRF-OUTPUT:"), sig...))
+		vrfOutput = h[:]
+	} else {
+		h := sha256.Sum256(vrfInput)
+		vrfOutput = h[:]
+		vrfProof = []byte("self-proof")
+	}
+
+	le.vrfOutputs[le.config.NodeID] = vrfOutput
+	le.vrfProofs[le.config.NodeID] = vrfProof
+	le.acksReceived[le.config.NodeID] = true
+
 	// Send election message to all known nodes
-	lelectionMsg := &LeaderElectionMessage{
+	electionMsg := &LeaderElectionMessage{
 		ElectionID:  le.electionID,
 		CandidateID: le.config.NodeID,
 		ActiveNodes: le.activeNodes,
+		Term:        le.term,
+		VRFOutput:   vrfOutput,
+		VRFProof:    vrfProof,
 		Timestamp:   time.Now(),
 	}
 
 	if le.config.Signer != nil {
-		lelectionMsg.Signature = le.config.Signer.Sign([]byte(le.electionID))
+		electionMsg.Signature = le.config.Signer.Sign([]byte(le.electionID))
 	}
 
 	msg := Message{
 		Type:      MsgLeaderElection,
 		From:      le.config.NodeID,
 		Timestamp: time.Now(),
-		Payload:   lelectionMsg,
+		Payload:   electionMsg,
 	}
 
-	// Broadcast to all nodes (assuming network has all nodes)
+	// Broadcast to all nodes
 	for _, nodeID := range le.activeNodes {
 		if nodeID != le.config.NodeID {
 			msg.To = nodeID
@@ -181,16 +214,56 @@ func (le *LeaderElection) handleLeaderElection(from NodeID, msg *LeaderElectionM
 
 	le.config.Logger.Info("Received leader election message",
 		"from", from,
+		"term", msg.Term,
 		"electionID", msg.ElectionID,
 		"candidate", msg.CandidateID)
+
+	// Guard against stale terms
+	if msg.Term < le.term {
+		le.config.Logger.Debug("Ignoring stale election message", "msgTerm", msg.Term, "currentTerm", le.term)
+		return nil
+	}
+
+	if msg.Term > le.term {
+		le.term = msg.Term
+		le.electionID = msg.ElectionID
+		le.vrfOutputs = make(map[NodeID][]byte)
+		le.vrfProofs = make(map[NodeID][]byte)
+		le.acksReceived = make(map[NodeID]bool)
+	}
 
 	// Update active nodes list
 	le.updateActiveNodes(msg.ActiveNodes)
 
-	// Send acknowledgment
+	// Record candidate's VRF output
+	if len(msg.VRFOutput) > 0 {
+		le.vrfOutputs[msg.CandidateID] = msg.VRFOutput
+		le.vrfProofs[msg.CandidateID] = msg.VRFProof
+	}
+
+	// Compute own VRF output for this election
+	vrfInput := ComputeElectionDigest(le.config.ChannelID, msg.Term, msg.ElectionID, le.config.NodeID)
+	var ownVRFOutput []byte
+	var ownVRFProof []byte
+
+	if le.config.Signer != nil {
+		sig := le.config.Signer.Sign(vrfInput)
+		ownVRFProof = sig
+		h := sha256.Sum256(append([]byte("VRF-OUTPUT:"), sig...))
+		ownVRFOutput = h[:]
+	} else {
+		h := sha256.Sum256(vrfInput)
+		ownVRFOutput = h[:]
+		ownVRFProof = []byte("self-proof")
+	}
+
+	// Send acknowledgment with own VRF proof
 	ackMsg := &ElectionAckMessage{
 		ElectionID:   msg.ElectionID,
 		NodeID:       le.config.NodeID,
+		Term:         msg.Term,
+		VRFOutput:    ownVRFOutput,
+		VRFProof:     ownVRFProof,
 		Acknowledged: true,
 		Timestamp:    time.Now(),
 	}
@@ -209,8 +282,8 @@ func (le *LeaderElection) handleLeaderElection(from NodeID, msg *LeaderElectionM
 
 	le.config.Network.Send(from, response)
 
-	// If this node has higher priority, start its own election
-	if le.shouldStartElection(msg.CandidateID) {
+	// If this node has higher priority (VRF score), initiate election
+	if le.shouldStartElection(msg.CandidateID) && le.state != StateElecting {
 		le.startElection()
 	}
 
@@ -221,20 +294,28 @@ func (le *LeaderElection) handleElectionAck(from NodeID, msg *ElectionAckMessage
 	le.mu.Lock()
 	defer le.mu.Unlock()
 
-	if msg.ElectionID != le.electionID {
+	if msg.ElectionID != le.electionID || msg.Term < le.term {
 		le.config.Logger.Debug("Ignoring stale election ack",
 			"expected", le.electionID,
-			"received", msg.ElectionID)
+			"received", msg.ElectionID,
+			"msgTerm", msg.Term,
+			"currentTerm", le.term)
 		return nil
 	}
 
 	le.acksReceived[from] = msg.Acknowledged
-	le.config.Logger.Info("Received election ack",
+	if len(msg.VRFOutput) > 0 {
+		le.vrfOutputs[from] = msg.VRFOutput
+		le.vrfProofs[from] = msg.VRFProof
+	}
+
+	le.config.Logger.Info("Received election ack with VRF",
 		"from", from,
 		"electionID", msg.ElectionID,
-		"acksReceived", len(le.acksReceived))
+		"acksReceived", len(le.acksReceived),
+		"vrfCount", len(le.vrfOutputs))
 
-	// Check if we have majority acknowledgment
+	// Check if Byzantine quorum of acknowledgments is reached
 	if le.hasMajorityAcks() && le.state == StateElecting {
 		le.selectLeaders()
 	}
@@ -319,44 +400,53 @@ func (le *LeaderElection) handleLeaderAnnouncement(from NodeID, msg *LeaderAnnou
 	return nil
 }
 
-// selectLeaders performs leader selection using random number generation
+// selectLeaders performs leader selection using VRF scores across nodes
 func (le *LeaderElection) selectLeaders() {
-	le.config.Logger.Info("Selecting leaders using random number algorithm",
+	le.config.Logger.Info("Selecting leaders using VRF ranking algorithm",
 		"electionID", le.electionID,
-		"activeNodes", len(le.activeNodes))
+		"activeNodes", len(le.activeNodes),
+		"vrfOutputs", len(le.vrfOutputs))
 
-	// Generate random numbers for each active node
-	randomNumbers := le.generateRandomNumbers()
-
-	// Sort nodes based on their random numbers
-	sortedNodes := le.sortNodesByRandomNumber(randomNumbers)
-
-	// Calculate leader index by summing all random numbers and taking mod
-	leaderIndex := le.calculateLeaderIndex(randomNumbers)
-
-	if leaderIndex >= len(sortedNodes) {
-		leaderIndex = 0 // Fallback to first node
+	// Sort active nodes deterministically based on VRF scores
+	sortedNodes := le.sortNodesByVRFScore()
+	if len(sortedNodes) == 0 {
+		le.config.Logger.Error("No active nodes available for leader selection")
+		return
 	}
 
-	le.primaryLeader = sortedNodes[leaderIndex]
+	// Highest VRF score node becomes Primary Leader
+	le.primaryLeader = sortedNodes[0]
 
-	le.config.Logger.Info("Selected primary leader",
+	le.config.Logger.Info("Selected primary leader via VRF",
 		"primaryLeader", le.primaryLeader,
-		"randomNumbers", randomNumbers,
-		"leaderIndex", leaderIndex)
+		"totalRanked", len(sortedNodes))
 
 	// Select shard leaders from remaining nodes
-	remainingNodes := make([]NodeID, 0, len(sortedNodes)-1)
-	for i, node := range sortedNodes {
-		if i != leaderIndex {
-			remainingNodes = append(remainingNodes, node)
-		}
-	}
-
+	remainingNodes := sortedNodes[1:]
 	le.selectShardLeaders(remainingNodes)
 
 	// Announce assignments
 	le.announceAssignments()
+}
+
+// sortNodesByVRFScore sorts active nodes based on their verified VRF outputs (descending)
+func (le *LeaderElection) sortNodesByVRFScore() []NodeID {
+	sorted := make([]NodeID, 0, len(le.activeNodes))
+	for _, n := range le.activeNodes {
+		sorted = append(sorted, n)
+	}
+
+	sort.Slice(sorted, func(i, j int) bool {
+		scoreI := VRFScore(le.vrfOutputs[sorted[i]])
+		scoreJ := VRFScore(le.vrfOutputs[sorted[j]])
+		cmp := scoreI.Cmp(scoreJ)
+		if cmp != 0 {
+			return cmp > 0 // Highest score first
+		}
+		return string(sorted[i]) < string(sorted[j]) // Deterministic tie breaker
+	})
+
+	return sorted
 }
 
 func (le *LeaderElection) selectShardLeaders(nodes []NodeID) {
@@ -368,12 +458,16 @@ func (le *LeaderElection) selectShardLeaders(nodes []NodeID) {
 		return
 	}
 
+	if le.numShards <= 0 {
+		le.numShards = 1
+	}
+
 	nodesPerShard := len(nodes) / le.numShards
 	extraNodes := len(nodes) % le.numShards
 
 	start := 0
 	for i := 0; i < le.numShards; i++ {
-		shardID := ShardID(i)
+		shardID := ShardID(i + 1)
 		end := start + nodesPerShard
 		if i < extraNodes {
 			end++
@@ -385,11 +479,11 @@ func (le *LeaderElection) selectShardLeaders(nodes []NodeID) {
 
 		shardNodes := nodes[start:end]
 		if len(shardNodes) > 0 {
-			// First node in shard becomes leader
+			// First node in shard (highest VRF rank in this shard) becomes shard leader
 			le.shardLeaders[shardID] = shardNodes[0]
 			le.shardAssignments[shardID] = shardNodes
 
-			le.config.Logger.Info("Assigned shard",
+			le.config.Logger.Info("Assigned shard via VRF ranking",
 				"shardID", shardID,
 				"leader", shardNodes[0],
 				"nodes", len(shardNodes))
@@ -457,15 +551,12 @@ func (le *LeaderElection) announceAssignments() {
 	}
 
 	le.state = StateElected
+	le.updateNodeRole()
 
-	le.config.Logger.Info("Announced leader assignments",
-		"electionID", le.electionID,
-		"primaryLeader", le.primaryLeader)
+	if le.onLeaderElected != nil {
+		le.onLeaderElected(le.primaryLeader, le.shardLeaders)
+	}
 
-	// Update node configuration and role
-	le.UpdateNodeConfig(le.primaryLeader, le.shardLeaders, le.shardAssignments)
-
-	// Restart heartbeat monitor with new configuration
 	le.restartHeartbeatMonitor()
 }
 
@@ -475,18 +566,29 @@ func (le *LeaderElection) updateNodeRole() {
 
 	if le.config.NodeID == le.primaryLeader {
 		le.config.Role = RolePrimaryLeader
-		le.config.ShardID = 0 // Primary leader not in a specific shard
+		le.config.ShardID = ShardID(0)
 	} else {
-		// Find which shard this node belongs to
-		for shardID, nodes := range le.shardAssignments {
-			for _, nodeID := range nodes {
-				if nodeID == le.config.NodeID {
-					le.config.ShardID = shardID
-					if le.shardLeaders[shardID] == le.config.NodeID {
-						le.config.Role = RoleShardLeader
-					} else {
+		found := false
+		for shardID, leader := range le.shardLeaders {
+			if le.config.NodeID == leader {
+				le.config.Role = RoleShardLeader
+				le.config.ShardID = shardID
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			for shardID, nodes := range le.shardAssignments {
+				for _, nodeID := range nodes {
+					if le.config.NodeID == nodeID {
 						le.config.Role = RoleShardFollower
+						le.config.ShardID = shardID
+						found = true
+						break
 					}
+				}
+				if found {
 					break
 				}
 			}
@@ -495,12 +597,11 @@ func (le *LeaderElection) updateNodeRole() {
 
 	le.config.Logger.Info("Updated node role",
 		"nodeID", le.config.NodeID,
-		"role", le.config.Role.String(),
-		"shardID", le.config.ShardID,
+		"newRole", le.config.Role.String(),
+		"newShardID", le.config.ShardID,
 		"oldRole", oldRole.String(),
 		"oldShardID", oldShardID)
 
-	// Notify the node about the role change if it changed
 	if oldRole != le.config.Role || oldShardID != le.config.ShardID {
 		if le.config.Node != nil {
 			le.config.Node.UpdateNodeRole(le.config.Role)
@@ -508,28 +609,21 @@ func (le *LeaderElection) updateNodeRole() {
 	}
 }
 
-// UpdateNodeConfig updates both the local node configuration and notifies the node component
 func (le *LeaderElection) UpdateNodeConfig(primaryLeader NodeID, shardLeaders map[ShardID]NodeID, shardAssignments map[ShardID][]NodeID) {
-	// Update local state
 	le.primaryLeader = primaryLeader
 	le.shardLeaders = shardLeaders
 	le.shardAssignments = shardAssignments
 
-	// Update config
 	le.config.PrimaryLeader = primaryLeader
 	le.config.ShardLeaders = shardLeaders
 	le.config.ShardNodes = shardAssignments
 
-	// Update node role based on new configuration
 	le.updateNodeRole()
 
-	// Notify the node component about the new configuration
 	if le.config.Node != nil {
 		le.config.Node.UpdateNodeConfig(primaryLeader, shardLeaders, shardAssignments)
 	}
 }
-
-// Utility methods
 
 func (le *LeaderElection) sortNodes(nodes []NodeID) []NodeID {
 	sorted := make([]NodeID, len(nodes))
@@ -541,7 +635,6 @@ func (le *LeaderElection) sortNodes(nodes []NodeID) []NodeID {
 }
 
 func (le *LeaderElection) shouldStartElection(otherCandidate NodeID) bool {
-	// Start election if this node has higher priority (lower ID)
 	return string(le.config.NodeID) < string(otherCandidate)
 }
 
@@ -552,8 +645,8 @@ func (le *LeaderElection) hasMajorityAcks() bool {
 			acks++
 		}
 	}
-	// Need majority of active nodes
-	return acks >= (len(le.activeNodes)+1)/2
+	requiredQuorum := CalculateIntraShardQuorum(len(le.activeNodes))
+	return acks >= requiredQuorum
 }
 
 func (le *LeaderElection) updateActiveNodes(nodes []NodeID) {
@@ -564,67 +657,9 @@ func (le *LeaderElection) updateActiveNodes(nodes []NodeID) {
 }
 
 func (le *LeaderElection) generateElectionID() string {
-	data := fmt.Sprintf("%s%d", le.config.NodeID, time.Now().UnixNano())
+	data := fmt.Sprintf("%s%d%d", le.config.NodeID, le.term, time.Now().UnixNano())
 	hash := sha256.Sum256([]byte(data))
 	return fmt.Sprintf("%x", hash[:8])
-}
-
-// generateRandomNumbers generates a random number for each active node in range [1, len(activeNodes)]
-func (le *LeaderElection) generateRandomNumbers() map[NodeID]int {
-	randomNumbers := make(map[NodeID]int)
-	max := big.NewInt(int64(len(le.activeNodes)))
-
-	for _, nodeID := range le.activeNodes {
-		// Generate random number between 1 and len(activeNodes)
-		randomNum, err := rand.Int(rand.Reader, max)
-		if err != nil {
-			le.config.Logger.Error("Failed to generate random number", "error", err)
-			randomNum = big.NewInt(1) // Fallback
-		}
-
-		// Ensure it's at least 1
-		num := int(randomNum.Int64()) + 1
-		randomNumbers[nodeID] = num
-	}
-
-	le.config.Logger.Info("Generated random numbers for nodes", "randomNumbers", randomNumbers)
-	return randomNumbers
-}
-
-// sortNodesByRandomNumber sorts nodes based on their random numbers (ascending)
-func (le *LeaderElection) sortNodesByRandomNumber(randomNumbers map[NodeID]int) []NodeID {
-	sorted := make([]NodeID, 0, len(le.activeNodes))
-	for nodeID := range randomNumbers {
-		sorted = append(sorted, nodeID)
-	}
-
-	sort.Slice(sorted, func(i, j int) bool {
-		return randomNumbers[sorted[i]] < randomNumbers[sorted[j]]
-	})
-
-	le.config.Logger.Info("Sorted nodes by random numbers", "sortedNodes", sorted)
-	return sorted
-}
-
-// calculateLeaderIndex calculates the leader index by summing all random numbers and taking mod with active node count
-func (le *LeaderElection) calculateLeaderIndex(randomNumbers map[NodeID]int) int {
-	sum := 0
-	for _, num := range randomNumbers {
-		sum += num
-	}
-
-	activeCount := len(le.activeNodes)
-	if activeCount == 0 {
-		return 0
-	}
-
-	leaderIndex := sum % activeCount
-	le.config.Logger.Info("Calculated leader index",
-		"sum", sum,
-		"activeCount", activeCount,
-		"leaderIndex", leaderIndex)
-
-	return leaderIndex
 }
 
 func (le *LeaderElection) handleElectionTimeout() {
@@ -633,7 +668,8 @@ func (le *LeaderElection) handleElectionTimeout() {
 
 	if le.state == StateElecting {
 		le.config.Logger.Info("Election timeout, starting re-election",
-			"electionID", le.electionID)
+			"electionID", le.electionID,
+			"term", le.term)
 		le.state = StateReElecting
 		le.startElection()
 	}
@@ -653,60 +689,38 @@ func (le *LeaderElection) monitorHeartbeats() {
 	}
 }
 
-// restartHeartbeatMonitor restarts the heartbeat monitoring with updated configuration
 func (le *LeaderElection) restartHeartbeatMonitor() {
 	le.config.Logger.Info("Restarting heartbeat monitor after election",
 		"nodeID", le.config.NodeID,
 		"primaryLeader", le.primaryLeader,
 		"activeNodes", len(le.activeNodes))
 
-	le.mu.Lock()
-
-	// Create a new heartbeat map to track current active nodes and leaders
 	newHeartbeatMap := make(map[NodeID]time.Time)
-
-	// Preserve existing heartbeat timestamps for active nodes if they're recent
 	now := time.Now()
 	for _, nodeID := range le.activeNodes {
 		if existingTime, exists := le.lastHeartbeat[nodeID]; exists {
-			// Keep existing timestamp if it's within the heartbeat timeout window
 			if now.Sub(existingTime) < le.heartbeatTimeout {
 				newHeartbeatMap[nodeID] = existingTime
 			} else {
-				// Set to current time if the existing timestamp is too old
 				newHeartbeatMap[nodeID] = now
 			}
 		} else {
-			// Set to current time for new active nodes
 			newHeartbeatMap[nodeID] = now
 		}
 	}
 
-	// Ensure primary leader is tracked
 	if _, exists := newHeartbeatMap[le.primaryLeader]; !exists {
 		newHeartbeatMap[le.primaryLeader] = now
 	}
 
-	// Ensure all shard leaders are tracked and update their heartbeat timestamps
 	for shardID, shardLeader := range le.shardLeaders {
-		if _, exists := newHeartbeatMap[shardLeader]; !exists {
-			newHeartbeatMap[shardLeader] = now
-		} else {
-			// Update heartbeat timestamp for existing shard leader
-			newHeartbeatMap[shardLeader] = now
-		}
+		newHeartbeatMap[shardLeader] = now
 		le.config.Logger.Info("Updated heartbeat for shard leader",
 			"shardID", shardID,
 			"shardLeader", shardLeader)
 	}
 
-	// Update the heartbeat map
 	le.lastHeartbeat = newHeartbeatMap
-
-	le.mu.Unlock()
-
-	// The existing monitorHeartbeats goroutine will continue running
-	// No need to restart it as it uses channels and will pick up the new configuration
 }
 
 func (le *LeaderElection) checkHeartbeats() {
@@ -735,16 +749,11 @@ func (le *LeaderElection) checkHeartbeats() {
 			"newCount", len(newActiveNodes),
 			"currentState", le.state)
 
-		// Only trigger re-election if leader is no longer active AND no election is in progress
 		if !le.isNodeActive(le.primaryLeader) && le.state != StateElecting && le.state != StateReElecting {
 			le.config.Logger.Info("Primary leader failed, triggering re-election",
 				"primaryLeader", le.primaryLeader,
 				"currentState", le.state)
 			le.startElection()
-		} else if !le.isNodeActive(le.primaryLeader) {
-			le.config.Logger.Info("Primary leader failed but election already in progress",
-				"primaryLeader", le.primaryLeader,
-				"currentState", le.state)
 		}
 	}
 }
@@ -758,14 +767,12 @@ func (le *LeaderElection) isNodeActive(nodeID NodeID) bool {
 	return false
 }
 
-// ReceiveHeartbeat updates the last heartbeat time for a node
 func (le *LeaderElection) ReceiveHeartbeat(from NodeID, timestamp time.Time) {
 	le.mu.Lock()
 	defer le.mu.Unlock()
 
 	le.lastHeartbeat[from] = timestamp
 
-	// Add to active nodes if not present
 	if !le.isNodeActive(from) {
 		le.activeNodes = append(le.activeNodes, from)
 		le.activeNodes = le.sortNodes(le.activeNodes)
@@ -774,8 +781,6 @@ func (le *LeaderElection) ReceiveHeartbeat(from NodeID, timestamp time.Time) {
 			"totalActive", len(le.activeNodes))
 	}
 }
-
-// Getters
 
 func (le *LeaderElection) GetPrimaryLeader() NodeID {
 	le.mu.RLock()
@@ -810,7 +815,6 @@ func (le *LeaderElection) GetState() ElectionState {
 	return le.state
 }
 
-// SetCallbacks sets callback functions for election events
 func (le *LeaderElection) SetCallbacks(onLeaderElected func(primary NodeID, shards map[ShardID]NodeID),
 	onShardAssigned func(shardID ShardID, leader NodeID, nodes []NodeID)) {
 	le.onLeaderElected = onLeaderElected

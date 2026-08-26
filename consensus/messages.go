@@ -190,6 +190,9 @@ type LeaderElectionMessage struct {
 	ElectionID   string
 	CandidateID  NodeID
 	ActiveNodes  []NodeID
+	Term         uint64
+	VRFOutput    []byte
+	VRFProof     []byte
 	Timestamp    time.Time
 	Signature    []byte
 }
@@ -198,6 +201,9 @@ type LeaderElectionMessage struct {
 type ElectionAckMessage struct {
 	ElectionID   string
 	NodeID       NodeID
+	Term         uint64
+	VRFOutput    []byte
+	VRFProof     []byte
 	Acknowledged bool
 	Timestamp    time.Time
 	Signature    []byte

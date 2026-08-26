@@ -135,10 +135,11 @@ func ComputeViewChangeDigest(channelID string, newView uint64, shardID ShardID, 
 }
 
 // ComputeElectionDigest calculates the digest for a Leader Election message
-func ComputeElectionDigest(channelID string, electionID string, candidateID NodeID) []byte {
+func ComputeElectionDigest(channelID string, term uint64, electionID string, candidateID NodeID) []byte {
 	dw := newDigestWriter()
 	dw.writeLengthPrefixed([]byte(DomainLeaderElection))
 	dw.writeLengthPrefixed([]byte(channelID))
+	dw.writeUint64(term)
 	dw.writeLengthPrefixed([]byte(electionID))
 	dw.writeLengthPrefixed([]byte(candidateID))
 	return dw.sum()

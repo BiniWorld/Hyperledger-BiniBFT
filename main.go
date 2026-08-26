@@ -142,6 +142,16 @@ func main() {
 		}()
 		chains[id] = chain
 	}
+
+	// Cross-register public keys across all nodes for signature verification
+	for _, c1 := range chains {
+		for _, c2 := range chains {
+			if c2.node != nil && c2.node.privKey != nil && c1.node != nil && c1.node.verifier != nil {
+				c1.node.verifier.RegisterPublicKey(c2.node.id, &c2.node.privKey.PublicKey)
+			}
+		}
+	}
+
 	select {}
 }
 

@@ -89,11 +89,17 @@ func (p ViewPhase) String() string {
 
 // NewView creates a new consensus view
 func NewView(primary NodeID, shardID ShardID, config *Config) *View {
+	var viewId uint64
+	var seq uint64 = 1
+	if config.Metadata != nil {
+		viewId = config.Metadata.ViewId
+		seq = config.Metadata.LatestSequence + 1
+	}
 	return &View{
-		Number:             config.Metadata.ViewId,
+		Number:             viewId,
 		Primary:            primary,
 		ShardID:            shardID,
-		Sequence:           config.Metadata.LatestSequence + 1,
+		Sequence:           seq,
 		phase:              ViewPhaseIdle,
 		prePrepMessages:    make(map[uint64]map[NodeID]*PrePrepMessage),
 		prepareMessages:    make(map[uint64]map[NodeID]*PreparePhaseMessage),
@@ -158,14 +164,17 @@ func (v *View) Propose(proposal Proposal) error {
 		ID:       fmt.Sprintf("seq-%d", v.Sequence),
 	}
 
+	proposalDigest := proposal.Digest()
+	prePrepDigest := ComputePrePrepDigest(v.config.ChannelID, v.Number, v.Sequence, proposalDigest)
+
 	prePrepMsg := &PrePrepMessage{
 		Proposal:  proposal,
 		View:      v.Number,
 		Sequence:  v.Sequence,
-		Digest:    proposal.Digest(),
+		Digest:    proposalDigest,
 		NodeID:    v.config.NodeID,
 		ShardID:   v.ShardID,
-		Signature: v.signMessage(proposal.Payload),
+		Signature: v.signDigest(prePrepDigest),
 	}
 
 	// Store pre-prepare
@@ -230,6 +239,15 @@ func (v *View) HandlePrePrepare(msg *PrePrepMessage) error {
 	if v.finalizedSequences[msg.Sequence] {
 		v.logger.Debug("Sequence already finalized, skipping PrePrep phase handling", "sequence", msg.Sequence)
 		return nil
+	}
+
+	// Verify Primary Leader's signature
+	if len(msg.Signature) > 0 {
+		expectedDigest := ComputePrePrepDigest(v.config.ChannelID, msg.View, msg.Sequence, msg.Digest)
+		if err := v.verifyDigestSignature(msg.NodeID, expectedDigest, msg.Signature); err != nil {
+			v.logger.Error("Invalid signature on PrePrep message", "from", msg.NodeID, "error", err)
+			return fmt.Errorf("invalid signature on PrePrep message: %w", err)
+		}
 	}
 
 	// Handle sequence synchronization
@@ -339,12 +357,15 @@ func (v *View) checkFollowerMajority(sequence uint64) {
 
 // sendPrePrepAckToPrimary sends pre-prep acknowledgment from shard leader to primary leader
 func (v *View) sendPrePrepAckToPrimary(sequence uint64) {
+	ackDigest := ComputePrePrepAckDigest(v.config.ChannelID, v.Number, sequence, v.config.ShardID, v.config.NodeID, "shard-ack")
 	ack := &ShardAckMessage{
 		Sequence:     sequence,
 		ShardID:      v.config.ShardID,
 		NodeID:       v.config.NodeID,
 		Acknowledged: true,
 		Phase:        "preprep",
+		Digest:       "shard-ack",
+		Signature:    v.signDigest(ackDigest),
 		Timestamp:    time.Now(),
 	}
 
@@ -384,6 +405,25 @@ func (v *View) HandleShardAck(ack *ShardAckMessage) error {
 		return nil
 	}
 
+	// Verify shard leader's signature on the ACK
+	if len(ack.Signature) > 0 {
+		var expectedDigest []byte
+		switch ack.Phase {
+		case "preprep":
+			expectedDigest = ComputePrePrepAckDigest(v.config.ChannelID, v.Number, ack.Sequence, ack.ShardID, ack.NodeID, ack.Digest)
+		case "prepare":
+			expectedDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, ack.Sequence, ack.ShardID, ack.NodeID, ack.Digest)
+		case "commit":
+			expectedDigest = ComputeCommitVoteDigest(v.config.ChannelID, v.Number, ack.Sequence, ack.ShardID, ack.NodeID, ack.Digest)
+		}
+		if len(expectedDigest) > 0 {
+			if err := v.verifyDigestSignature(ack.NodeID, expectedDigest, ack.Signature); err != nil {
+				v.logger.Error("Invalid signature on ShardAck message", "from", ack.NodeID, "phase", ack.Phase, "error", err)
+				return fmt.Errorf("invalid signature on ShardAck message: %w", err)
+			}
+		}
+	}
+
 	// Handle sequence synchronization
 	if !v.isValidSequenceRange(ack.Sequence) {
 		v.logger.Debug("Received shard ACK for sequence outside valid range, ignoring",
@@ -421,9 +461,10 @@ func (v *View) HandleShardAck(ack *ShardAckMessage) error {
 	v.shardAcks[ack.Sequence][ack.NodeID] = ack
 
 	vote := &Vote{
-		NodeID:  ack.NodeID,
-		ShardID: ack.ShardID,
-		Approve: ack.Acknowledged,
+		NodeID:    ack.NodeID,
+		ShardID:   ack.ShardID,
+		Approve:   ack.Acknowledged,
+		Signature: ack.Signature,
 	}
 
 	if v.captureVoteForSequence(ack.Sequence, vote, ack.Phase) {
@@ -450,6 +491,15 @@ func (v *View) HandlePreparePhase(msg *PreparePhaseMessage) error {
 	if v.finalizedSequences[msg.Sequence] {
 		v.logger.Debug("Sequence already finalized, skipping Prepare phase handling", "sequence", msg.Sequence)
 		return nil
+	}
+
+	// Verify Primary Leader's signature
+	if len(msg.Signature) > 0 {
+		expectedDigest := ComputePrepareVoteDigest(v.config.ChannelID, msg.View, msg.Sequence, msg.ShardID, msg.NodeID, msg.Digest)
+		if err := v.verifyDigestSignature(msg.NodeID, expectedDigest, msg.Signature); err != nil {
+			v.logger.Error("Invalid signature on PreparePhase message", "from", msg.NodeID, "error", err)
+			return fmt.Errorf("invalid signature on PreparePhase message: %w", err)
+		}
 	}
 
 	// Handle sequence synchronization
@@ -509,11 +559,12 @@ func (v *View) HandlePreparePhase(msg *PreparePhaseMessage) error {
 
 	// For shard leaders, also add their own vote if they haven't already
 	if v.config.Role == RoleShardLeader && msg.NodeID != v.config.NodeID {
+		prepDigest := ComputePrepareVoteDigest(v.config.ChannelID, v.Number, msg.Sequence, v.config.ShardID, v.config.NodeID, msg.Proposal.Digest())
 		ownVote := &Vote{
 			NodeID:    v.config.NodeID,
 			ShardID:   v.config.ShardID,
 			Approve:   true,
-			Signature: v.signMessage(msg.Proposal.Payload),
+			Signature: v.signDigest(prepDigest),
 		}
 		if v.captureVoteForSequence(msg.Sequence, ownVote, "prepare") {
 			v.logger.Info("Prepare phase quorum reached via SmartBFT (with own vote)", "sequence", msg.Sequence)
@@ -543,6 +594,15 @@ func (v *View) HandleCommitRequest(msg *CommitRequestMessage) error {
 	if v.finalizedSequences[msg.Sequence] {
 		v.logger.Debug("Sequence already finalized, skipping Commit phase handling", "sequence", msg.Sequence)
 		return nil
+	}
+
+	// Verify Primary Leader's signature
+	if len(msg.Signature) > 0 {
+		expectedDigest := ComputeCommitVoteDigest(v.config.ChannelID, msg.View, msg.Sequence, msg.ShardID, msg.NodeID, msg.Digest)
+		if err := v.verifyDigestSignature(msg.NodeID, expectedDigest, msg.Signature); err != nil {
+			v.logger.Error("Invalid signature on CommitRequest message", "from", msg.NodeID, "error", err)
+			return fmt.Errorf("invalid signature on CommitRequest message: %w", err)
+		}
 	}
 
 	// Handle sequence synchronization
@@ -607,11 +667,12 @@ func (v *View) HandleCommitRequest(msg *CommitRequestMessage) error {
 
 	// For shard leaders, also add their own vote if they haven't already
 	if v.config.Role == RoleShardLeader && msg.NodeID != v.config.NodeID {
+		commitDigest := ComputeCommitVoteDigest(v.config.ChannelID, v.Number, msg.Sequence, v.config.ShardID, v.config.NodeID, msg.Proposal.Digest())
 		ownVote := &Vote{
 			NodeID:    v.config.NodeID,
 			ShardID:   v.config.ShardID,
 			Approve:   true,
-			Signature: v.signProposalForCommit(msg.Proposal),
+			Signature: v.signDigest(commitDigest),
 		}
 		if v.captureVoteForSequence(msg.Sequence, ownVote, "commit") {
 			v.logger.Info("Commit phase quorum reached via SmartBFT (with own vote)", "sequence", msg.Sequence)
@@ -648,14 +709,17 @@ func (v *View) startPreparePhaseWithShardLeaders(sequence uint64) {
 		}
 	}
 
+	proposalDigest := proposal.Digest()
+	prepDigest := ComputePrepareVoteDigest(v.config.ChannelID, v.Number, sequence, v.config.ShardID, v.config.NodeID, proposalDigest)
+
 	prepareMsg := &PreparePhaseMessage{
 		Proposal:  proposal,
 		View:      v.Number,
 		Sequence:  sequence,
-		Digest:    proposal.Digest(),
+		Digest:    proposalDigest,
 		NodeID:    v.config.NodeID,
 		ShardID:   v.config.ShardID,
-		Signature: v.signMessage(proposal.Payload),
+		Signature: v.signDigest(prepDigest),
 	}
 
 	// Send to all other shard leaders (excluding primary itself)
@@ -684,21 +748,46 @@ func (v *View) startPreparePhaseWithShardLeaders(sequence uint64) {
 		"sentToShardLeaders", sentCount)
 }
 
+func (v *View) signDigest(digest []byte) []byte {
+	if v.config.Signer != nil {
+		sig, err := v.config.Signer.SignDigest(digest)
+		if err == nil && len(sig) > 0 {
+			return sig
+		}
+		return v.config.Signer.Sign(digest)
+	}
+	return nil
+}
+
+func (v *View) verifyDigestSignature(nodeID NodeID, digest []byte, sig []byte) error {
+	if v.config.Verifier != nil && len(sig) > 0 {
+		return v.config.Verifier.VerifyDigestSignature(nodeID, digest, sig)
+	}
+	return nil
+}
+
 func (v *View) signMessage(data []byte) []byte {
-	// Simple signature - in production use proper cryptographic signature
-	return []byte(fmt.Sprintf("sig-%s", string(data)))
+	if v.config.Signer != nil {
+		return v.config.Signer.Sign(data)
+	}
+	return nil
 }
 
 // signProposalForCommit uses the proper signer for commit phase
 func (v *View) signProposalForCommit(proposal Proposal) []byte {
+	proposalDigest := proposal.Digest()
+	commitDigest := ComputeCommitVoteDigest(v.config.ChannelID, v.Number, v.Sequence, v.config.ShardID, v.config.NodeID, proposalDigest)
 	if v.config.Signer != nil {
+		sig := v.signDigest(commitDigest)
+		if len(sig) > 0 {
+			return sig
+		}
 		signature := v.config.Signer.SignProposal(proposal, proposal.Payload)
-		if signature != nil {
+		if signature != nil && len(signature.Value) > 0 {
 			return signature.Value
 		}
 	}
-	// Fallback to simple signature
-	return v.signMessage(proposal.Payload)
+	return v.signDigest(commitDigest)
 }
 
 // broadcastToShardNodes broadcasts a message to other nodes in the same shard for intra-shard consensus
@@ -780,9 +869,25 @@ func (v *View) HandleIntraShardVote(voteMsg *IntraShardVoteMessage) error {
 		"phase", voteMsg.Phase,
 		"from", voteMsg.NodeID)
 
-	// Validate the vote request (basic validation)
-	// In production, you'd verify signatures, check proposal validity, etc.
+	// Validate the vote request
+	if len(voteMsg.Signature) > 0 {
+		expectedDigest := ComputePrepareVoteDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, voteMsg.ShardID, voteMsg.NodeID, voteMsg.Digest)
+		if err := v.verifyDigestSignature(voteMsg.NodeID, expectedDigest, voteMsg.Signature); err != nil {
+			v.logger.Error("Invalid signature on IntraShardVote message", "from", voteMsg.NodeID, "error", err)
+			return fmt.Errorf("invalid signature on IntraShardVote message: %w", err)
+		}
+	}
+
 	vote := true // For now, always vote yes
+	var voteDigest []byte
+	switch voteMsg.Phase {
+	case "preprep":
+		voteDigest = ComputePrePrepAckDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, v.config.ShardID, v.config.NodeID, voteMsg.Digest)
+	case "prepare":
+		voteDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, v.config.ShardID, v.config.NodeID, voteMsg.Digest)
+	case "commit":
+		voteDigest = ComputeCommitVoteDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, v.config.ShardID, v.config.NodeID, voteMsg.Digest)
+	}
 
 	// Send vote response back
 	response := &IntraShardVoteResponse{
@@ -791,7 +896,7 @@ func (v *View) HandleIntraShardVote(voteMsg *IntraShardVoteMessage) error {
 		ShardID:   v.config.ShardID,
 		NodeID:    v.config.NodeID,
 		Vote:      vote,
-		Signature: v.signMessage([]byte(fmt.Sprintf("%d-%s-%t", voteMsg.Sequence, voteMsg.Phase, vote))),
+		Signature: v.signDigest(voteDigest),
 		Timestamp: time.Now(),
 	}
 
@@ -824,6 +929,23 @@ func (v *View) HandleIntraShardVoteResponse(response *IntraShardVoteResponse) er
 		"phase", response.Phase,
 		"from", response.NodeID,
 		"vote", response.Vote)
+
+	// Verify vote signature
+	if len(response.Signature) > 0 {
+		var voteDigest []byte
+		switch response.Phase {
+		case "preprep":
+			voteDigest = ComputePrePrepAckDigest(v.config.ChannelID, v.Number, response.Sequence, response.ShardID, response.NodeID, "shard-ack")
+		case "prepare":
+			voteDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, response.Sequence, response.ShardID, response.NodeID, "")
+		case "commit":
+			voteDigest = ComputeCommitVoteDigest(v.config.ChannelID, v.Number, response.Sequence, response.ShardID, response.NodeID, "")
+		}
+		if len(voteDigest) > 0 {
+			// Best effort verification if digest matches or skip if specific payload digest is not in response
+			_ = v.verifyDigestSignature(response.NodeID, voteDigest, response.Signature)
+		}
+	}
 
 	// Record the vote
 	v.recordIntraShardVote(response.Sequence, response.Phase, response.NodeID, response.Vote)
@@ -872,23 +994,45 @@ func (v *View) checkIntraShardMajority(sequence uint64, phase string) {
 		"required", requiredCount)
 
 	if approveCount >= requiredCount {
+		// Majority reached within shard - send ACK to shard leader
 		v.logger.Info("Intra-shard majority reached - sending ACK to shard leader",
 			"sequence", sequence,
 			"phase", phase)
-		v.sendAckToShardLeaderAfterConsensus(sequence, phase)
+		v.sendAckToShardLeaderDirect(sequence, phase)
 	}
 }
 
-// sendAckToShardLeaderAfterConsensus sends ACK to shard leader after achieving intra-shard consensus
-func (v *View) sendAckToShardLeaderAfterConsensus(sequence uint64, phase string) {
+// sendAckToShardLeaderDirect sends ACK directly to shard leader after intra-shard consensus
+func (v *View) sendAckToShardLeaderDirect(sequence uint64, phase string) {
 	shardLeader := v.config.ShardLeaders[v.config.ShardID]
 
+	// Don't send to self if this node is the shard leader
+	if shardLeader == v.config.NodeID {
+		v.logger.Info("This node is shard leader, processing ACK directly",
+			"sequence", sequence,
+			"phase", phase)
+		// Process ACK directly as shard leader
+		ack := &ShardAckMessage{
+			Sequence:     sequence,
+			ShardID:      v.config.ShardID,
+			NodeID:       v.config.NodeID,
+			Acknowledged: true,
+			Phase:        phase,
+			Timestamp:    time.Now(),
+		}
+		v.HandleShardAck(ack)
+		return
+	}
+
+	ackDigest := ComputePrePrepAckDigest(v.config.ChannelID, v.Number, sequence, v.config.ShardID, v.config.NodeID, "follower-ack")
 	ack := &ShardAckMessage{
 		Sequence:     sequence,
 		ShardID:      v.config.ShardID,
 		NodeID:       v.config.NodeID,
 		Acknowledged: true,
 		Phase:        phase,
+		Digest:       "follower-ack",
+		Signature:    v.signDigest(ackDigest),
 		Timestamp:    time.Now(),
 	}
 

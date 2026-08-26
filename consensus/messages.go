@@ -147,6 +147,9 @@ type ShardAckMessage struct {
 	NodeID       NodeID
 	Acknowledged bool
 	Phase        string // "preprep", "prepare", "commit"
+	Digest       string
+	Signature    []byte
+	Signatures   map[NodeID][]byte // Collected follower signatures for the shard quorum
 	Timestamp    time.Time
 }
 

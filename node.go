@@ -63,6 +63,10 @@ type Node struct {
 	heartbeatMonitorWG     sync.WaitGroup
 	heartbeatSeen          map[consensus.NodeID]bool
 	heartbeatMutex         sync.RWMutex // Mutex for heartbeat maps
+
+	signer   *ECDSASigner
+	verifier *ECDSAVerifier
+	privKey  *ecdsa.PrivateKey
 }
 
 type Metrix struct {
@@ -113,6 +117,17 @@ func NewNode(
 		panic(fmt.Sprintf("Failed to create consensus storage: %v", err))
 	}
 
+	privKey, err := GenerateKeyPair()
+	if err != nil {
+		logger.Error("Failed to generate ECDSA key for node", "error", err)
+	}
+	channelID := "default-channel"
+	signer := NewECDSASigner(id, privKey, channelID)
+	verifier := NewECDSAVerifier(channelID)
+	if privKey != nil {
+		verifier.RegisterPublicKey(id, &privKey.PublicKey)
+	}
+
 	node := &Node{
 		// db:          db,
 		address:     address,
@@ -136,6 +151,10 @@ func NewNode(
 		heartbeatSeen:  make(map[consensus.NodeID]bool),
 		roleUpdateChan: make(chan consensus.NodeRole, 1),
 		comm:           comm,
+
+		signer:   signer,
+		verifier: verifier,
+		privKey:  privKey,
 	}
 	metadata := &protos.ViewMetadata{
 		LatestSequence: 0,
@@ -168,6 +187,8 @@ func NewNode(
 	builder.WithRequestInspector(node)
 	builder.WithApplication(node) // Use the node as the application delivery interface
 	builder.WithSigner(node)      // Use the node as the signer
+	builder.WithVerifier(verifier)
+	builder.WithChannelID(channelID)
 
 	// Configure ALL shards for cross-shard coordination using the cluster config
 	// This is needed so the primary leader knows about all shard leaders

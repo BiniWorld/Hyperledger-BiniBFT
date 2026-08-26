@@ -235,6 +235,26 @@ func (b *ConsensusBuilder) WithSigner(signer Signer) *ConsensusBuilder {
 	return b
 }
 
+func (b *ConsensusBuilder) WithVerifier(verifier Verifier) *ConsensusBuilder {
+	if b.err != nil {
+		return b
+	}
+
+	b.config.Verifier = verifier
+
+	return b
+}
+
+func (b *ConsensusBuilder) WithChannelID(channelID string) *ConsensusBuilder {
+	if b.err != nil {
+		return b
+	}
+
+	b.config.ChannelID = channelID
+
+	return b
+}
+
 // Build creates a new consensus instance
 func (b *ConsensusBuilder) Build() (*Consensus, error) {
 	if b.err != nil {

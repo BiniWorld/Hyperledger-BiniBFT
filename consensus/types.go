@@ -211,6 +211,10 @@ type Config struct {
 	Application ApplicationDelivery
 	// Signer for signing proposals and messages
 	Signer Signer
+	// Verifier for verifying node signatures and quorum certificates
+	Verifier Verifier
+	// ChannelID for multi-channel domain separation
+	ChannelID string
 	// Node reference for role updates
 	Node NodeUpdater // Interface for node role updates
 }
@@ -253,6 +257,34 @@ type ApplicationDelivery interface {
 type Signer interface {
 	SignProposal(proposal Proposal, data []byte) *Signature
 	Sign(msg []byte) []byte
+	SignDigest(digest []byte) ([]byte, error)
+}
+
+// Verifier interface for verifying node signatures and quorum certificates
+type Verifier interface {
+	VerifySignature(nodeID NodeID, data []byte, signature []byte) error
+	VerifyDigestSignature(nodeID NodeID, digest []byte, signature []byte) error
+	VerifyProposalSignature(nodeID NodeID, proposal Proposal, sig Signature) error
+}
+
+// ShardQC represents an intra-shard quorum certificate
+type ShardQC struct {
+	ChannelID  string
+	View       uint64
+	Sequence   uint64
+	Phase      string // "preprep", "prepare", "commit"
+	ShardID    ShardID
+	Digest     string
+	Signatures map[NodeID][]byte
+}
+
+// CommitQC represents a cross-shard commit quorum certificate
+type CommitQC struct {
+	ChannelID string
+	View      uint64
+	Sequence  uint64
+	Digest    string
+	ShardQCs  map[ShardID]*ShardQC
 }
 
 // NodeUpdater interface for updating node roles and configuration

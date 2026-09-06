@@ -20,10 +20,25 @@ type Communicator struct {
 	clientsMutex      sync.RWMutex
 	logger            consensus.Logger
 	handler           consensus.MessageHandler
+	tlsConfig         *tls.Config
+	timeout           time.Duration
+}
+
+func (c *Communicator) SetTLSConfig(tlsConfig *tls.Config) {
+	c.clientsMutex.Lock()
+	defer c.clientsMutex.Unlock()
+	c.tlsConfig = tlsConfig
+	// Clear cached clients to adopt new TLS config
+	c.cachedHttpClients = make(map[consensus.NodeID]*http.Client)
+}
+
+func (c *Communicator) SetTimeout(timeout time.Duration) {
+	c.clientsMutex.Lock()
+	defer c.clientsMutex.Unlock()
+	c.timeout = timeout
 }
 
 func (c *Communicator) getOrCreateClient(targetID consensus.NodeID) *http.Client {
-	// First, try to get the client with a read lock
 	c.clientsMutex.RLock()
 	http3Client, ok := c.cachedHttpClients[targetID]
 	c.clientsMutex.RUnlock()
@@ -32,24 +47,36 @@ func (c *Communicator) getOrCreateClient(targetID consensus.NodeID) *http.Client
 		return http3Client
 	}
 
-	// If not found, acquire write lock and create new client
 	c.clientsMutex.Lock()
 	defer c.clientsMutex.Unlock()
 
-	// Double-check in case another goroutine created it while we were waiting
 	if http3Client, ok := c.cachedHttpClients[targetID]; ok {
 		return http3Client
 	}
 
-	rt := &http3.Transport{
-		TLSClientConfig: &tls.Config{
+	var clientTLS *tls.Config
+	if c.tlsConfig != nil {
+		clientTLS = c.tlsConfig.Clone()
+	} else {
+		clientTLS = &tls.Config{
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"quic-echo-example"},
-		},
+		}
+	}
+
+	rt := &http3.Transport{
+		TLSClientConfig:    clientTLS,
 		DisableCompression: true,
 	}
+
+	timeout := c.timeout
+	if timeout == 0 {
+		timeout = 5 * time.Second
+	}
+
 	http3Client = &http.Client{
 		Transport: rt,
+		Timeout:   timeout,
 	}
 	c.cachedHttpClients[targetID] = http3Client
 	return http3Client
@@ -108,18 +135,17 @@ func (c *Communicator) Send(targetID consensus.NodeID, message consensus.Message
 	}
 
 	http3Client := c.getOrCreateClient(targetID)
-	// Send HTTP/3 request to consensus endpoint for inter-node communication
 	url := fmt.Sprintf("https://%s/consensus", endpoint.Address)
 	go func() {
 		resp, err := http3Client.Post(url, "application/json", bytes.NewBuffer(data))
 		if err != nil {
+			c.logger.Debug("Failed to deliver consensus message", "to", targetID, "error", err)
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			c.logger.Info(fmt.Sprintf("Node %s sent transaction to node %s", c.nodeId, targetID))
-			return
+			c.logger.Debug("Consensus message returned non-200", "to", targetID, "status", resp.StatusCode)
 		}
 	}()
 
@@ -138,13 +164,13 @@ func (c *Communicator) SendTransaction(targetID consensus.NodeID, request []byte
 	go func() {
 		resp, err := http3Client.Post(url, "application/octet-stream", bytes.NewBuffer(request))
 		if err != nil {
+			c.logger.Debug("Failed to deliver transaction", "to", targetID, "error", err)
 			return
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			c.logger.Info(fmt.Sprintf("Node %s sent transaction to node %s", c.nodeId, targetID))
-			return
+			c.logger.Debug("Transaction returned non-200", "to", targetID, "status", resp.StatusCode)
 		}
 	}()
 	return nil

@@ -364,6 +364,20 @@ func (c *Node) unmarshalConsensusMessage(data []byte) (*consensus.Message, error
 		}
 		message.Payload = &payload
 
+	case consensus.MsgSyncRequest:
+		var payload consensus.SyncRequestMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal SyncRequestMessage: %w", err)
+		}
+		message.Payload = &payload
+
+	case consensus.MsgSyncResponse:
+		var payload consensus.SyncResponseMessage
+		if err := json.Unmarshal(tempMsg.Payload, &payload); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal SyncResponseMessage: %w", err)
+		}
+		message.Payload = &payload
+
 	default:
 		// For unknown message types, keep as raw JSON
 		message.Payload = tempMsg.Payload

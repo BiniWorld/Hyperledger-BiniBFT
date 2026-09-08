@@ -1,2 +1,6 @@
 blocks
 data
+binibft
+deployment/crypto-config/
+deployment/channel-artifacts/
+deployment/genesis.block

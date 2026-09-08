@@ -2,6 +2,7 @@ package main
 
 import (
 	"binibft-poc/consensus"
+	"flag"
 	"fmt"
 	"log/slog"
 	"math"
@@ -23,44 +24,62 @@ type clusterConfig struct {
 }
 
 func main() {
-	shardMap := make(map[consensus.ShardID]Shard)
+	var (
+		numNodes   int
+		numShards  int
+		numTxs     int
+		txInterval time.Duration
+	)
+
+	flag.IntVar(&numNodes, "nodes", 7, "Total number of consensus nodes in cluster")
+	flag.IntVar(&numShards, "shards", 2, "Number of consensus shards")
+	flag.IntVar(&numTxs, "txs", 10, "Number of transactions to submit for consensus")
+	flag.DurationVar(&txInterval, "tx-interval", 500*time.Millisecond, "Interval between submitted transactions")
+	flag.Parse()
+
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		AddSource: false,
 		Level:     slog.LevelInfo,
 	}))
-	numNodes := 50
 
+	logger.Info("Starting BiniBFT Consensus Cluster",
+		"nodes", numNodes,
+		"shards", numShards,
+		"txs", numTxs)
+
+	shardMap := make(map[consensus.ShardID]Shard)
 	networkOpts := NetworkOptions{
 		NumNodes:     numNodes,
-		BatchSize:    10,
-		BatchTimeout: 2 * time.Second,
+		BatchSize:    5,
+		BatchTimeout: 1 * time.Second,
 	}
 
-	primary, shards := generateShardsWithRandomAssignment(numNodes, 7)
+	primary, shards := generateShardsWithRandomAssignment(numNodes, numShards)
 	for i, shard := range shards {
-		shardID := consensus.ShardID(i + 1) // Assuming ShardID is int-based
+		shardID := consensus.ShardID(i + 1)
 		shardMap[shardID] = shard
 	}
-	fmt.Printf("primary: %v\n", primary)
-	fmt.Printf("shards: %v\n", shards)
+
+	logger.Info("Assigned cluster topology",
+		"primaryLeader", primary,
+		"shardCount", len(shards))
+
 	clusterConfig := clusterConfig{
 		primaryId: primary,
 		shards:    shardMap,
 	}
 
 	chains := make(map[int]*Chain)
-
 	mapNodes := make(map[string]*NodeInfo)
 	for id := 1; id <= networkOpts.NumNodes; id++ {
 		mapNodes[fmt.Sprintf("%d", id)] = &NodeInfo{
 			ID:         fmt.Sprintf("%d", id),
-			Address:    fmt.Sprintf("localhost:%d", 10000+id),
-			OpsAddress: fmt.Sprintf("localhost:%d", 20000+id),
+			Address:    fmt.Sprintf("127.0.0.1:%d", 10000+id),
+			OpsAddress: fmt.Sprintf("127.0.0.1:%d", 20000+id),
 		}
 	}
 
 	for id := 1; id <= networkOpts.NumNodes; id++ {
-		logger.Info("Initializing node", "nodeId", id)
 		address := mapNodes[fmt.Sprintf("%d", id)].Address
 		opsAddress := mapNodes[fmt.Sprintf("%d", id)].OpsAddress
 
@@ -75,13 +94,11 @@ func main() {
 		nodeIDStr := consensus.NodeID(fmt.Sprintf("%d", id))
 
 		if nodeIDStr == clusterConfig.primaryId {
-			// Primary leader - assign to a special shard or manage all shards
-			shardId = 0 // Primary leader can be associated with shard 0 for simplicity
+			shardId = 0
 			role = consensus.RolePrimaryLeader
-			followers = []consensus.NodeID{} // Primary leader doesn't have direct followers
+			followers = []consensus.NodeID{}
 			shardLeaderId = clusterConfig.primaryId
 		} else {
-			// Check if this node is a shard leader
 			found := false
 			for sid, shard := range clusterConfig.shards {
 				if nodeIDStr == shard.LeaderId {
@@ -94,24 +111,17 @@ func main() {
 				}
 			}
 
-			// If not a shard leader, check if it's a follower
 			if !found {
 				for sid, shard := range clusterConfig.shards {
 					if slices.Contains(shard.Followers, nodeIDStr) {
 						shardId = sid
 						role = consensus.RoleShardFollower
-						followers = []consensus.NodeID{} // Followers don't have followers
+						followers = []consensus.NodeID{}
 						shardLeaderId = shard.LeaderId
 						found = true
 						break
 					}
 				}
-			}
-
-			// If node is not found in any shard configuration, log an error
-			if !found {
-				logger.Error("Node not found in cluster configuration", "nodeId", id)
-				continue
 			}
 		}
 
@@ -120,7 +130,7 @@ func main() {
 			address,
 			opsAddress,
 			mapNodes,
-			logger.With("nodeId", id).With("address", address),
+			logger,
 			networkOpts,
 			walDir,
 			blocksDir,
@@ -129,21 +139,23 @@ func main() {
 			followers,
 			role,
 			clusterConfig.primaryId,
-			clusterConfig, // Pass the entire cluster configuration
+			clusterConfig,
 		)
-		go func() {
-			nodeID := id
-			_ = nodeID
+
+		go func(nodeID int, ch *Chain) {
 			for {
-				block := chain.Listen()
-				// _ = block
-				logger.Info(fmt.Sprintf("Node: %d block: %v", nodeID, block))
+				block := ch.Listen()
+				logger.Info("Delivered consensus block",
+					"nodeID", nodeID,
+					"sequence", block.Sequence,
+					"txCount", len(block.Transactions))
 			}
-		}()
+		}(id, chain)
+
 		chains[id] = chain
 	}
 
-	// Cross-register public keys across all nodes for signature verification
+	// Cross-register ECDSA public keys across all nodes
 	for _, c1 := range chains {
 		for _, c2 := range chains {
 			if c2.node != nil && c2.node.privKey != nil && c1.node != nil && c1.node.verifier != nil {
@@ -152,34 +164,57 @@ func main() {
 		}
 	}
 
+	logger.Info("All nodes initialized and public keys registered")
+
+	// Wait 1 second for cluster to settle
+	time.Sleep(1 * time.Second)
+
+	// Ingest transactions to primary leader
+	primaryIDInt, _ := strconv.Atoi(string(primary))
+	primaryChain := chains[primaryIDInt]
+
+	if primaryChain != nil && primaryChain.node != nil {
+		go func() {
+			logger.Info("Submitting client transactions to Primary Leader", "primary", primary, "totalTxs", numTxs)
+			for i := 1; i <= numTxs; i++ {
+				now := int(time.Now().UnixNano())
+				data := fmt.Sprintf("TransferAsset(asset-%d, 100)", i)
+				txID := consensus.ComputeTransactionDigest("default-channel", "client-demo", now, data)
+				tx := Transaction{
+					ClientID: "client-demo",
+					TS:       now,
+					ID:       txID,
+					Data:     data,
+				}
+				rawTx := tx.ToBytes()
+				if err := primaryChain.node.consensus.SubmitRequest(rawTx); err != nil {
+					logger.Error("Failed to submit request", "txID", tx.ID, "error", err)
+				} else {
+					logger.Info("Submitted transaction to consensus pool", "txID", tx.ID)
+				}
+				time.Sleep(txInterval)
+			}
+			logger.Info("Finished submitting all client transactions")
+		}()
+	}
+
+	// Run indefinitely or until interrupted
 	select {}
 }
 
 func calculateSecondaryLeaderCount(totalNodes int, maxSecondaryLeaders int) int {
-	remainingNodes := totalNodes - 1 // excluding primary
-
-	idealSecondaryLeaders := int(math.Min(float64(remainingNodes/7), float64(maxSecondaryLeaders)))
-	if idealSecondaryLeaders < 3 {
-		idealSecondaryLeaders = 3
-	}
-	if idealSecondaryLeaders%2 == 0 {
-		idealSecondaryLeaders++
-	}
-
-	const maxFollowersPerLeader = 9
-	for idealSecondaryLeaders > 1 {
-		availableFollowers := remainingNodes - idealSecondaryLeaders
-		if availableFollowers/idealSecondaryLeaders > maxFollowersPerLeader {
-			idealSecondaryLeaders--
-		} else {
-			break
-		}
+	remainingNodes := totalNodes - 1
+	idealSecondaryLeaders := int(math.Min(float64(remainingNodes/3), float64(maxSecondaryLeaders)))
+	if idealSecondaryLeaders < 1 {
+		idealSecondaryLeaders = 1
 	}
 	return idealSecondaryLeaders
 }
 
-// Distributes followers evenly across leaders
 func distributeFollowers(numFollowers, numLeaders int) []int {
+	if numLeaders <= 0 {
+		return []int{}
+	}
 	followersPerLeader := make([]int, numLeaders)
 	for i := range followersPerLeader {
 		followersPerLeader[i] = numFollowers / numLeaders
@@ -195,14 +230,14 @@ func generateRandomNodeIDs(total int) []consensus.NodeID {
 	for i := 0; i < total; i++ {
 		nodes[i] = consensus.NodeID(strconv.Itoa(i + 1))
 	}
-	rand.Seed(time.Now().UnixNano())
-	rand.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	r.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
 	return nodes
 }
 
 func generateShardsWithRandomAssignment(totalNodes int, maxSecondaryLeaders int) (consensus.NodeID, []Shard) {
-	if totalNodes < 4 {
-		panic("Need at least 4 nodes (1 primary + 3 secondary leaders) to form shards")
+	if totalNodes < 3 {
+		panic("Need at least 3 nodes to form BiniBFT cluster")
 	}
 	if maxSecondaryLeaders > totalNodes-1 {
 		maxSecondaryLeaders = totalNodes - 1
@@ -213,9 +248,8 @@ func generateShardsWithRandomAssignment(totalNodes int, maxSecondaryLeaders int)
 	remainingNodes := allNodes[1:]
 
 	numSecondaryLeaders := calculateSecondaryLeaderCount(totalNodes, maxSecondaryLeaders)
-
 	if numSecondaryLeaders >= len(remainingNodes) {
-		panic("Not enough nodes to assign as secondary leaders")
+		numSecondaryLeaders = len(remainingNodes)
 	}
 
 	secondaryLeaders := remainingNodes[:numSecondaryLeaders]
@@ -231,7 +265,7 @@ func generateShardsWithRandomAssignment(totalNodes int, maxSecondaryLeaders int)
 		numFollowers := followersPerLeader[i]
 		endIndex := currentIndex + numFollowers
 		if endIndex > len(followerPool) {
-			panic(fmt.Sprintf("Trying to assign %d followers, but only %d available", numFollowers, len(followerPool)-currentIndex))
+			endIndex = len(followerPool)
 		}
 		shards[i] = Shard{
 			LeaderId:  secondaryLeaders[i],

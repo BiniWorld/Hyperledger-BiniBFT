@@ -42,13 +42,42 @@ func (c *BiniBFTConsenter) HandleChain(support ConsenterSupport, metadata *Metad
 		return nil, fmt.Errorf("empty channel ID in ConsenterSupport")
 	}
 
-	signer := NewFabricSignerAdapter(c.opts.NodeID, support)
+	nodeID := c.opts.NodeID
+	shardID := c.opts.ShardID
+	role := c.opts.Role
+	primaryLeader := c.opts.PrimaryLeader
+	shardLeaders := c.opts.ShardLeaders
+	shardNodes := c.opts.ShardNodes
+
+	// If channel metadata specifies BiniBFT config, load and apply it
+	if metadata != nil && len(metadata.Value) > 0 {
+		cfg, err := UnmarshalConfig(metadata.Value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse BiniBFT channel metadata: %w", err)
+		}
+		primaryLeader = consensus.NodeID(cfg.PrimaryLeader)
+		if len(cfg.Shards) > 0 {
+			shardLeaders = make(map[consensus.ShardID]consensus.NodeID)
+			shardNodes = make(map[consensus.ShardID][]consensus.NodeID)
+			for _, sh := range cfg.Shards {
+				sid := consensus.ShardID(sh.ShardID)
+				shardLeaders[sid] = consensus.NodeID(sh.Leader)
+				nodes := []consensus.NodeID{consensus.NodeID(sh.Leader)}
+				for _, f := range sh.Followers {
+					nodes = append(nodes, consensus.NodeID(f))
+				}
+				shardNodes[sid] = nodes
+			}
+		}
+	}
+
+	signer := NewFabricSignerAdapter(nodeID, support)
 	verifier := NewFabricVerifierAdapter(support)
 
 	builder := consensus.NewConsensusBuilder()
 	builder.WithChannelID(channelID)
-	builder.WithNode(c.opts.NodeID, c.opts.ShardID, c.opts.Role)
-	builder.WithPrimaryLeader(c.opts.PrimaryLeader)
+	builder.WithNode(nodeID, shardID, role)
+	builder.WithPrimaryLeader(primaryLeader)
 	builder.WithSigner(signer)
 	builder.WithVerifier(verifier)
 	builder.WithRequestInspector(verifier)
@@ -60,9 +89,9 @@ func (c *BiniBFTConsenter) HandleChain(support ConsenterSupport, metadata *Metad
 		builder.WithLogger(c.opts.Logger)
 	}
 
-	for shardID, leader := range c.opts.ShardLeaders {
-		followers := c.opts.ShardNodes[shardID]
-		builder.WithShard(shardID, leader, followers)
+	for sid, leader := range shardLeaders {
+		followers := shardNodes[sid]
+		builder.WithShard(sid, leader, followers)
 	}
 
 	biniConsensus, err := builder.Build()
@@ -73,9 +102,9 @@ func (c *BiniBFTConsenter) HandleChain(support ConsenterSupport, metadata *Metad
 	chain := NewBiniBFTChain(
 		support,
 		biniConsensus,
-		c.opts.NodeID,
-		c.opts.ShardID,
-		c.opts.Role,
+		nodeID,
+		shardID,
+		role,
 		c.opts.Logger,
 	)
 

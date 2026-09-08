@@ -1,0 +1,28 @@
+# Crypto Configuration for BiniBFT Hyperledger Fabric Network
+OrdererOrgs:
+  - Name: Orderer
+    Domain: example.com
+    EnableNodeOUs: true
+    Specs:
+      - Hostname: orderer1 # Primary Leader
+      - Hostname: orderer2 # Shard 1 Leader
+      - Hostname: orderer3 # Shard 1 Follower
+      - Hostname: orderer4 # Shard 2 Leader
+      - Hostname: orderer5 # Shard 2 Follower
+
+PeerOrgs:
+  - Name: Org1
+    Domain: org1.example.com
+    EnableNodeOUs: true
+    Template:
+      Count: 1
+    Users:
+      Count: 1
+
+  - Name: Org2
+    Domain: org2.example.com
+    EnableNodeOUs: true
+    Template:
+      Count: 1
+    Users:
+      Count: 1

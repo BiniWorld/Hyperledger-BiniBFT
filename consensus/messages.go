@@ -182,6 +182,7 @@ type IntraShardVoteResponse struct {
 	Phase     string
 	ShardID   ShardID
 	NodeID    NodeID
+	Digest    string
 	Vote      bool // true for approve, false for reject
 	Signature []byte
 	Timestamp time.Time

@@ -292,9 +292,15 @@ func (v *View) HandlePrePrepare(msg *PrePrepMessage) error {
 		ID:       fmt.Sprintf("seq-%d", msg.Sequence),
 	}
 
-	// Store pre-prep message
+	// Store pre-prep message and check for equivocation
 	if _, exists := v.prePrepMessages[msg.Sequence]; !exists {
 		v.prePrepMessages[msg.Sequence] = make(map[NodeID]*PrePrepMessage)
+	} else if existing, exists := v.prePrepMessages[msg.Sequence][msg.NodeID]; exists {
+		if existing.Digest != msg.Digest {
+			v.logger.Error("Equivocation detected: conflicting proposal for sequence", "sequence", msg.Sequence, "from", msg.NodeID)
+			return fmt.Errorf("equivocation detected: conflicting proposal for sequence %d from %s", msg.Sequence, msg.NodeID)
+		}
+		return nil // Duplicate identical pre-prep: ignore safely
 	}
 	v.prePrepMessages[msg.Sequence][msg.NodeID] = msg
 
@@ -810,21 +816,32 @@ func (v *View) broadcastToShardNodes(payload interface{}, phase string) {
 		sequence = msg.Sequence
 		proposal = msg.Proposal
 		digest = msg.Digest
-		signature = msg.Signature
 	case *PreparePhaseMessage:
 		sequence = msg.Sequence
 		proposal = msg.Proposal
 		digest = msg.Digest
-		signature = msg.Signature
 	case *CommitRequestMessage:
 		sequence = msg.Sequence
 		proposal = msg.Proposal
 		digest = msg.Digest
-		signature = msg.Signature
 	default:
 		v.logger.Error("Unknown message type for intra-shard broadcast")
 		return
 	}
+
+	// Sign intra-shard vote with this node's own private key
+	var ownDigest []byte
+	switch phase {
+	case "preprep":
+		ownDigest = ComputePrePrepAckDigest(v.config.ChannelID, v.Number, sequence, v.config.ShardID, v.config.NodeID, "shard-ack")
+	case "prepare":
+		ownDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, sequence, v.config.ShardID, v.config.NodeID, digest)
+	case "commit":
+		ownDigest = ComputeCommitVoteDigest(v.config.ChannelID, v.Number, sequence, v.config.ShardID, v.config.NodeID, digest)
+	default:
+		ownDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, sequence, v.config.ShardID, v.config.NodeID, digest)
+	}
+	signature = v.signDigest(ownDigest)
 
 	voteMsg := &IntraShardVoteMessage{
 		Sequence:  sequence,
@@ -876,7 +893,17 @@ func (v *View) HandleIntraShardVote(voteMsg *IntraShardVoteMessage) error {
 
 	// Validate the vote request
 	if len(voteMsg.Signature) > 0 {
-		expectedDigest := ComputePrepareVoteDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, voteMsg.ShardID, voteMsg.NodeID, voteMsg.Digest)
+		var expectedDigest []byte
+		switch voteMsg.Phase {
+		case "preprep":
+			expectedDigest = ComputePrePrepAckDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, voteMsg.ShardID, voteMsg.NodeID, "shard-ack")
+		case "prepare":
+			expectedDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, voteMsg.ShardID, voteMsg.NodeID, voteMsg.Digest)
+		case "commit":
+			expectedDigest = ComputeCommitVoteDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, voteMsg.ShardID, voteMsg.NodeID, voteMsg.Digest)
+		default:
+			expectedDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, voteMsg.ShardID, voteMsg.NodeID, voteMsg.Digest)
+		}
 		if err := v.verifyDigestSignature(voteMsg.NodeID, expectedDigest, voteMsg.Signature); err != nil {
 			v.logger.Error("Invalid signature on IntraShardVote message", "from", voteMsg.NodeID, "error", err)
 			return fmt.Errorf("invalid signature on IntraShardVote message: %w", err)
@@ -887,7 +914,7 @@ func (v *View) HandleIntraShardVote(voteMsg *IntraShardVoteMessage) error {
 	var voteDigest []byte
 	switch voteMsg.Phase {
 	case "preprep":
-		voteDigest = ComputePrePrepAckDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, v.config.ShardID, v.config.NodeID, voteMsg.Digest)
+		voteDigest = ComputePrePrepAckDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, v.config.ShardID, v.config.NodeID, "shard-ack")
 	case "prepare":
 		voteDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, voteMsg.Sequence, v.config.ShardID, v.config.NodeID, voteMsg.Digest)
 	case "commit":
@@ -900,6 +927,7 @@ func (v *View) HandleIntraShardVote(voteMsg *IntraShardVoteMessage) error {
 		Phase:     voteMsg.Phase,
 		ShardID:   v.config.ShardID,
 		NodeID:    v.config.NodeID,
+		Digest:    voteMsg.Digest,
 		Vote:      vote,
 		Signature: v.signDigest(voteDigest),
 		Timestamp: time.Now(),
@@ -942,13 +970,15 @@ func (v *View) HandleIntraShardVoteResponse(response *IntraShardVoteResponse) er
 		case "preprep":
 			voteDigest = ComputePrePrepAckDigest(v.config.ChannelID, v.Number, response.Sequence, response.ShardID, response.NodeID, "shard-ack")
 		case "prepare":
-			voteDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, response.Sequence, response.ShardID, response.NodeID, "")
+			voteDigest = ComputePrepareVoteDigest(v.config.ChannelID, v.Number, response.Sequence, response.ShardID, response.NodeID, response.Digest)
 		case "commit":
-			voteDigest = ComputeCommitVoteDigest(v.config.ChannelID, v.Number, response.Sequence, response.ShardID, response.NodeID, "")
+			voteDigest = ComputeCommitVoteDigest(v.config.ChannelID, v.Number, response.Sequence, response.ShardID, response.NodeID, response.Digest)
 		}
 		if len(voteDigest) > 0 {
-			// Best effort verification if digest matches or skip if specific payload digest is not in response
-			_ = v.verifyDigestSignature(response.NodeID, voteDigest, response.Signature)
+			if err := v.verifyDigestSignature(response.NodeID, voteDigest, response.Signature); err != nil {
+				v.logger.Error("Invalid signature on IntraShardVoteResponse message", "from", response.NodeID, "error", err)
+				return fmt.Errorf("invalid signature on IntraShardVoteResponse message: %w", err)
+			}
 		}
 	}
 

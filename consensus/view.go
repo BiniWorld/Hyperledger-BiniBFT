@@ -757,6 +757,13 @@ func (v *View) startPreparePhaseWithShardLeaders(sequence uint64) {
 	v.logger.Info("Prepare phase distribution complete",
 		"sequence", sequence,
 		"sentToShardLeaders", sentCount)
+
+	// If there are no other shard leaders, proceed directly to commit phase
+	if sentCount == 0 {
+		v.logger.Info("No other shard leaders - proceeding directly to commit phase",
+			"sequence", sequence)
+		v.startCommitPhaseWithShardLeaders(sequence)
+	}
 }
 
 func (v *View) signDigest(digest []byte) []byte {

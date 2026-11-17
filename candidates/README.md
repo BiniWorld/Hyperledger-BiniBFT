@@ -20,6 +20,7 @@ The mentee's main focus will be on creating detailed reports for each task or le
 
 [Siddhant Prateek Mahanayak](./siddhantprateek/README.md)
 [Sahilsher Singh Sandhu](./sahilsher-singh/README.md)
+[Ragini Sharma](./RaginiSharma/README.md)
 
 ## Conclusion
 
